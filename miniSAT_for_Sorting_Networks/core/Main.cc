@@ -1,0 +1,1652 @@
+/*****************************************************************************************[Main.cc]
+Copyright (c) 2003-2006, Niklas Een, Niklas Sorensson
+Copyright (c) 2007-2010, Niklas Sorensson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+**************************************************************************************************/
+
+#include <errno.h>
+
+#include <signal.h>
+#include <zlib.h>
+
+#include "utils/System.h"
+#include "utils/ParseUtils.h"
+#include "utils/Options.h"
+#include "core/Dimacs.h"
+#include "core/Solver.h"
+#include "Solver.h"
+#include "../mtl/Vec.h"
+#include "SolverTypes.h"
+
+#include <vector>
+#include <map>
+#include <set>
+#include <algorithm>
+#include <fstream>
+
+using namespace Minisat;
+using namespace std;
+static BoolOption optfixFirstLayer("MAIN", "fixFirst", "fix first layer", false);
+static BoolOption opt_prefLayer("MAIN", "usePrefFile", "Use a prefix file", false);
+static BoolOption opt_someStartValues("MAIN", "useSomeValues", "Add some values and continue iteratively", false);
+static BoolOption opt_lastLayerConstraints("MAIN", "lastLayerConstraints", "Use constraints on last layers", true);
+
+static BoolOption opt_optEncoding("MAIN", "betterEncoding", "Use faster encoding", false);
+static IntOption opt_minNumInputs("MAIN", "minNumInputs", "Minimum number of inputs to use", 0, IntRange(0, INT32_MAX));
+static IntOption opt_row("MAIN", "row", "Row in File to use", 0, IntRange(0, INT32_MAX));
+static IntOption shrinkGen("MAIN", "shrink", "Shrink generated formula by this number of bits.\n", 0,
+                           IntRange(0, INT32_MAX));
+static StringOption prefFileName("MAIN", "prefFile", "Name of prefix file");
+
+//=================================================================================================
+
+void printStats(Solver &solver) {
+    double cpu_time = cpuTime();
+    double mem_used = memUsedPeak();
+    printf("restarts              : %"
+    PRIu64
+    "\n", solver.starts);
+    printf("conflicts             : %-12"
+    PRIu64
+    "   (%.0f /sec)\n", solver.conflicts, solver.conflicts / cpu_time);
+    printf("decisions             : %-12"
+    PRIu64
+    "   (%4.2f %% random) (%.0f /sec)\n", solver.decisions, (float) solver.rnd_decisions * 100 /
+                                                            (float) solver.decisions, solver.decisions / cpu_time);
+    printf("propagations          : %-12"
+    PRIu64
+    "   (%.0f /sec)\n", solver.propagations, solver.propagations / cpu_time);
+    printf("conflict literals     : %-12"
+    PRIu64
+    "   (%4.2f %% deleted)\n", solver.tot_literals, (solver.max_literals - solver.tot_literals) * 100 /
+                                                    (double) solver.max_literals);
+    if (mem_used != 0) printf("Memory used           : %.2f MB\n", mem_used);
+    printf("CPU time              : %g s\n", cpu_time);
+}
+
+
+static Solver *solver;
+
+// Terminate by notifying the solver and back out gracefully. This is mainly to have a test-case
+// for this feature of the Solver as it may take longer than an immediate call to '_exit()'.
+static void SIGINT_interrupt(int signum) { solver->interrupt(); }
+
+// Note that '_exit()' rather than 'exit()' has to be used. The reason is that 'exit()' calls
+// destructors and may cause deadlocks if a malloc/free function happens to be running (these
+// functions are guarded by locks for multithreaded use).
+static void SIGINT_exit(int signum) {
+    printStats(*solver);
+    printf("\n");
+    printf("*** INTERRUPTED ***\n");
+    _exit(1);
+}
+
+
+/**********************************************************************
+* The comparator class
+*/
+
+struct comparator {
+    int layer, minchan, maxchan;
+
+    comparator(int l, int minc, int maxc) : layer(l), minchan(minc), maxchan(maxc) { }
+
+    bool operator<(const comparator &other) const {
+        if (other.layer != layer)
+            return layer < other.layer;
+        if (other.minchan != minchan)
+            return minchan < other.minchan;
+        return maxchan < other.maxchan;
+    }
+};
+
+/**********************************************************************
+ * Compute the rating of an input, i.e. the number of leading zeros + tailing ones
+ */
+int getRating(int val, int n) {
+    int rVal = 0;
+    int m = 1;
+    for (int i = 0; i < n; i++) {
+        if (!(val & m))
+            rVal++;
+        else
+            break;
+        m <<= 1;
+    }
+    m = 1 << (n - 1);
+    for (int i = 0; i < n; i++) {
+        if (val & m)
+            rVal++;
+        else
+            break;
+        m >>= 1;
+    }
+    return rVal;
+}
+
+int getNumLeadingZeros(int val, int n) {
+    int rVal = 0;
+    for (int i = 0; i < n; i++) {
+        if (val & (1 << i))
+            return rVal;
+        rVal++;
+    }
+    return rVal;
+}
+
+int getNumTailingOnes(int val, int n) {
+    int mask = 1 << (n - 1);
+    int rVal = 0;
+    for (int i = 0; i < n; i++) {
+        if (!(val & mask))
+            return rVal;
+        mask >>= 1;
+        rVal++;
+    }
+    return rVal;
+}
+
+/**********************************************************************
+ * Perform the compare&swap of a comparator between channels i and j*/
+/* Precondition: i < j*/
+int comp(int val, int i, int j) {
+    if ((val & (1 << i)) && !(val & (1 << j))) {
+        val ^= ((1 << i) | (1 << j));
+    }
+    return val;
+}
+
+int evalParberry(int val, int bits) {
+    for (int i = 0; i < bits; i += 2) {
+        if (i + 1 < bits)
+            val = comp(val, i, i + 1);
+    }
+    return val;
+}
+
+/**********************************************************************
+ * Given an input "val", compute the output of a prefix */
+/* inputs: 
+ *      - val : The input to be "presorted"
+ *      - bits: The number of channels 
+ *      - comps: a vector of triples (d, i, j) containing the comparators and their respective layers
+ * */
+int eval(int val, vector<comparator> &comps) {
+    unsigned used = 0;
+    int layer = 0;
+    while (used < comps.size()) {
+        for (unsigned i = 0; i < comps.size(); i++) {
+            if (comps[i].layer == layer) {
+                int a = comps[i].minchan;
+                int b = comps[i].maxchan;
+                val = comp(val, min(a, b), max(a, b));
+                used++;
+            }
+        }
+        layer++;
+    }
+    return val;
+}
+
+
+typedef map<comparator, Var> triVarMap;
+
+/**********************************************************************
+ * a <=> b or c 
+ */
+void add_a_equals_b_or_c(Solver &s, Var &a, Var &b, Var &c) {
+    vec<Lit> ps;
+    //  A implies B or C
+    ps.push(~mkLit(a));
+    ps.push(mkLit(b));
+    ps.push(mkLit(c));
+    s.addClause(ps);
+    ps.clear();
+    // Not A implies (Not B and Not C)
+    ps.push(mkLit(a));
+    ps.push(~mkLit(b));
+    s.addClause(ps);
+    ps.clear();
+    ps.push(mkLit(a));
+    ps.push(~mkLit(c));
+    s.addClause(ps);
+    ps.clear();
+}
+
+/**********************************************************************
+ * a <=> b and c 
+ */
+void add_a_equals_b_and_c(Solver &s, Var &a, Var &b, Var &c) {
+    vec<Lit> ps;
+    //  not A implies (not B or not C)
+    ps.push(mkLit(a));
+    ps.push(~mkLit(b));
+    ps.push(~mkLit(c));
+    s.addClause(ps);
+    ps.clear();
+    //  A implies (B and  C)
+    ps.push(~mkLit(a));
+    ps.push(mkLit(b));
+    s.addClause(ps);
+    ps.clear();
+    ps.push(~mkLit(a));
+    ps.push(mkLit(c));
+    s.addClause(ps);
+    ps.clear();
+}
+
+/**********************************************************************
+ * x <=> y, i.e. x => y and (not x) => (not y) 
+ */
+void addEquals(Solver &s, Var &x, Var &y) {
+    vec<Lit> ps;
+    ps.push(mkLit(x));
+    ps.push(~mkLit(y));
+    s.addClause(ps);
+    ps.clear();
+    ps.push(~mkLit(x));
+    ps.push(mkLit(y));
+    s.addClause(ps);
+    ps.clear();
+}
+
+/********************************************************************** 
+ * Create a reference-network which computes a sorted output for variable input- and output-vectors. 
+ * This is done as a "bubble sort" network.
+ * */
+void createRefNetwork(Solver &s, vector<Var> &inputVars, vector<Var> &outputVars, int numBits, int numLayers,
+                      map<pair<int, int>, Var> &innerVars) {
+    Var varsInNetwork[numLayers - 1][numBits];
+    for (int i = 0; i < numLayers - 1; i++) {
+        for (int j = 0; j < numBits; j++) {
+            varsInNetwork[i][j] = s.newVar();
+            innerVars[make_pair(i, j)] = varsInNetwork[i][j];
+        }
+    }
+
+    for (int i = 0; i < numLayers; i++) {
+        /* If there is no comparator on the first channel, copy its value for the next layer*/
+        if (i % 2 == 1) {
+            addEquals(s, varsInNetwork[i - 1][0], i < numLayers - 1 ? varsInNetwork[i][0] : outputVars[0]);
+        }
+        for (int j = (i % 2); j < numBits; j += 2) {
+            if (j + 1 < numBits) {
+                // move "one" to line with higher index, i.e. v_{i, j+1} = v_{i-1, j+1} \vee v_{i-1, j+1}
+                add_a_equals_b_or_c(s, i < numLayers - 1 ? varsInNetwork[i][j + 1] : outputVars[j + 1],
+                                    i > 0 ? varsInNetwork[i - 1][j] : inputVars[j],
+                                    i > 0 ? varsInNetwork[i - 1][j + 1] : inputVars[j + 1]);
+                add_a_equals_b_and_c(s, i < numLayers - 1 ? varsInNetwork[i][j] : outputVars[j],
+                                     i > 0 ? varsInNetwork[i - 1][j] : inputVars[j],
+                                     i > 0 ? varsInNetwork[i - 1][j + 1] : inputVars[j + 1]);
+            }
+        }
+        /* If there is no comparator on the last channel, copy its value for the next layer*/
+        if (i % 2 != numBits % 2) {
+            addEquals(s, i > 0 ? varsInNetwork[i - 1][numBits - 1] : inputVars[numBits - 1],
+                      i < numLayers - 1 ? varsInNetwork[i][numBits - 1] : outputVars[numBits - 1]);
+        }
+    }
+}
+
+/**********************************************************************
+ * v <=> C, where C is a clause. 
+ * This is, if v is true, at least one of the literals in C must be true. 
+ * If v is false, ALL literals in C must be false
+ */
+void addEqual(Solver &s, Var &v, vec<Lit> &clause) {
+    vec<Lit> ps;
+    /* v implies clause */
+    for (int i = 0; i < clause.size(); i++)
+        ps.push(clause[i]);
+    ps.push(~mkLit(v));
+    s.addClause(ps);
+    ps.clear();
+    /* not v implies not clause */
+    for (int i = 0; i < clause.size(); i++) {
+        ps.push(mkLit(v));
+        ps.push(~clause[i]);
+        s.addClause(ps);
+        ps.clear();
+    }
+}
+
+/**********************************************************************
+ * Avoid Tseitin-encoding for this case, which appears quite often in a comparator network. 
+ * */
+void add_a_implies_b_equal_c_or_d(Solver &s, Var a, Var b, Var c, Var d) {
+    vec<Lit> ps;
+    ps.push(~mkLit(a));
+    ps.push(mkLit(b));
+    ps.push(~mkLit(c)); // (a and not b) implies not c
+    s.addClause(ps);
+    ps.clear();
+    ps.push(~mkLit(a));
+    ps.push(mkLit(b));
+    ps.push(~mkLit(d)); // (a and not b) implies not d
+    s.addClause(ps);
+    ps.clear();
+    ps.push(~mkLit(a));
+    ps.push(~mkLit(b));
+    ps.push(mkLit(c));
+    ps.push(mkLit(d));  // (a and  b) implies  c or d
+    s.addClause(ps);
+    ps.clear();
+}
+
+/**********************************************************************
+ * Avoid Tseitin-encoding for this case, which appears quite often in a comparator network. 
+ * */
+void add_a_implies_b_equal_c_and_d(Solver &s, Var a, Var b, Var c, Var d) {
+    vec<Lit> ps;
+    ps.push(~mkLit(a));
+    ps.push(~mkLit(b));
+    ps.push(mkLit(c)); // (a and b) implies c
+    s.addClause(ps);
+    ps.clear();
+    ps.push(~mkLit(a));
+    ps.push(~mkLit(b));
+    ps.push(mkLit(d)); // (a and b) implies d
+    s.addClause(ps);
+    ps.clear();
+    ps.push(~mkLit(a));
+    ps.push(mkLit(b));
+    ps.push(~mkLit(c));
+    ps.push(~mkLit(d));  // (a and not b) implies (not c or not d)
+    s.addClause(ps);
+    ps.clear();
+}
+
+/**********************************************************************
+ * Avoid Tseitin-encoding for this case, which appears quite often in a comparator network. 
+ * */
+void add_a_implies_b_equal_c(Solver &s, Lit a, Lit b, Lit c) {
+    vec<Lit> ps;
+    ps.push(~a);
+    ps.push(~b);
+    ps.push(c); // (a and b) imply c
+    s.addClause(ps);
+    ps.clear();
+    ps.push(~a);
+    ps.push(b);
+    ps.push(~c); // (a and not b) imply (not c)
+    s.addClause(ps);
+}
+
+/******************************************************************************
+ * Create a test-network. 
+ * For each possible comparator, a variable is created and stored in "compVars"
+ * This does NOT test whether the network is correct!
+ */
+void createTestNetWork(Solver &s, vector<Var> &inputVars, vector<Var> &outputVars, int numBits, int numLayers,
+                       map<comparator, Var> &compVars, map<pair<int, int>, Var> &internalVars) {
+    // create variables for inner states: 
+    Var varsInNetwork[numLayers - 1][numBits];
+    for (int i = 0; i < numLayers - 1; i++) {
+        for (int j = 0; j < numBits; j++) {
+            varsInNetwork[i][j] = s.newVar();
+            internalVars[make_pair(i, j)] = varsInNetwork[i][j];
+        }
+    }
+    // Create variables to describe which comparators are selected
+    for (int i = 0; i < numLayers; i++) {
+        for (int j = 0; j < numBits; j++) {
+            for (int k = j + 1; k < numBits; k++) {
+                Var c = s.newVar();
+                compVars[comparator(i, j, k)] = c;
+            }
+        }
+    }
+    // compute dependency between inner states and comparators
+    for (int i = 0; i < numLayers; i++) {
+        for (int j = 0; j < numBits; j++) {
+            // create unused-variable: 
+            Var u = s.newVar();
+            vec<Lit> compLits;
+            for (int k = 0; k < numBits; k++) {
+                if (j != k) {
+                    Var v = compVars[comparator(i, min(j, k), max(j, k))];
+                    compLits.push(mkLit(v));
+                }
+            }
+            addEqual(s, u, compLits);
+            // if there is no comparator for this line, the the output will be equal to the input
+            add_a_implies_b_equal_c(s, ~mkLit(u), mkLit(i > 0 ? varsInNetwork[i - 1][j] : inputVars[j]),
+                                    mkLit(i < numLayers - 1 ? varsInNetwork[i][j] : outputVars[j]));
+            for (int k = j + 1; k < numBits; k++) {
+                if (j != k) {
+                    int max = j > k ? j : k;
+                    int min = j < k ? j : k;
+                    add_a_implies_b_equal_c_or_d(s, compVars[comparator(i, min, max)],
+                                                 i < numLayers - 1 ? varsInNetwork[i][max] : outputVars[max],
+                                                 i > 0 ? varsInNetwork[i - 1][max] : inputVars[max],
+                                                 i > 0 ? varsInNetwork[i - 1][min] : inputVars[min]);
+                    add_a_implies_b_equal_c_and_d(s, compVars[comparator(i, min, max)],
+                                                  i < numLayers - 1 ? varsInNetwork[i][min] : outputVars[min],
+                                                  i > 0 ? varsInNetwork[i - 1][max] : inputVars[max],
+                                                  i > 0 ? varsInNetwork[i - 1][min] : inputVars[min]);
+                }
+            }
+        }
+    }
+}
+
+void addAtLeastOneDiffers(Solver &s, vector<Var> &out1, vector<Var> &out2, vector<Var> &diffIndVars) {
+    vec<Lit> diffVars;
+    for (unsigned i = 0; i < out1.size(); i++) {
+        /*
+         * hand-crafted: Encode all 4 situations
+         * (x and y) => not t
+         * (not x and not y) => not t
+         * (x and not y) => t
+         * (not x and y) => t
+         */
+        Var t = s.newVar();
+        diffIndVars.push_back(t);
+        diffVars.push(mkLit(t));
+        Var &x = out1[i];
+        Var &y = out2[i];
+
+        vec<Lit> ps;
+        ps.push(mkLit(t));
+        ps.push(~mkLit(x));
+        ps.push(mkLit(y));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(mkLit(t));
+        ps.push(mkLit(x));
+        ps.push(~mkLit(y));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(~mkLit(t));
+        ps.push(mkLit(x));
+        ps.push(mkLit(y));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(~mkLit(t));
+        ps.push(~mkLit(x));
+        ps.push(~mkLit(y));
+        s.addClause(ps);
+        ps.clear();
+
+    }
+    s.addClause(diffVars);
+}
+
+/******************************************************************************
+ * Parse our csv-file 
+ */
+void parseSecondlayer(vector<comparator> &out, const char *fileName, int row) {
+    FILE *fp = fopen(fileName, "r");
+    int BUF_SIZE = 1024;
+    char buffer[BUF_SIZE];
+    int rowRead = 0;
+    while (fp && !feof(fp)) {
+        fscanf(fp, "%s", buffer);
+        if (rowRead == row) {
+            char *buff = strtok(buffer, ";");
+            while (buff) {
+                int a, b, c;
+                a = atoi(buff);
+                buff = strtok(NULL, ";");
+                b = atoi(buff);
+                buff = strtok(NULL, ";");
+                c = atoi(buff);
+                buff = strtok(NULL, ";");
+                out.push_back(comparator(a, b, c));
+            }
+        }
+        rowRead++;
+    }
+}
+
+/******************************************************************************
+ * Add once-constraint to the formula, ensuring that every channel is used only
+ * once in each layer, i.e. c_{i, j, k} => not c_{i, j, l} forall l != k
+ */
+void once(Solver &s, int n, int d, map<comparator, Var> &compVars) {
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            for (int k = 0; k < n; k++) {
+                for (int l = k + 1; l < n; l++) {
+                    if (k != l && j != k && j != l) {
+                        vec<Lit> ps;
+                        ps.push(~mkLit(compVars[comparator(i, min(j, k), max(j, k))]));
+                        ps.push(~mkLit(compVars[comparator(i, min(j, l), max(j, l))]));
+                        s.addClause(ps);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/******************************************************************************
+ * Add variables indicating which channels are used
+ */
+void createUsedVariables(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used) {
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            vec<Lit> ps;
+            Var v = s.newVar();
+            used[make_pair(i, j)] = v;
+            for (int k = 0; k < n; k++) {
+                if (k < j)
+                    ps.push(mkLit(compVars[comparator(i, k, j)]));
+                else if (k > j)
+                    ps.push(mkLit(compVars[comparator(i, j, k)]));
+            }
+            addEqual(s, v, ps);
+        }
+    }
+}
+
+/******************************************************************************
+ * Every comparator of length 1 has to be used at least in one layer (cf. Knuth, TAOCP)
+ */
+void createConstraintsForLength1Comparators(Solver &s, int n, int d, map<comparator, Var> &compVars) {
+    for (int i = 0; i < n - 1; i++) {
+        vec<Lit> ps;
+        for (int j = 0; j < d; j++) {
+            ps.push(mkLit(compVars[comparator(j, i, i + 1)]));
+        }
+        s.addClause(ps);
+    }
+}
+
+/******************************************************************************
+ * Add constraints on layer layer
+ */
+void onlyShortComparatorsInLastLayer(Solver &s, int n, int d, map<comparator, Var> &compVars, vec<Lit> &ps) {
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            /* Handled by Phi2 as well*/
+            if (j > i + 1) {
+                ps.push(~mkLit(compVars[comparator(d - 1, i, j)]));
+                s.addClause(ps);
+                ps.clear();
+            }
+            if (j > i + 3) {
+                ps.push(~mkLit(compVars[comparator(d - 2, i, j)]));
+                s.addClause(ps);
+                ps.clear();
+            }
+        }
+    }
+}
+
+/******************************************************************************
+ * Add constraint phi_1 to the formula (see the article for more details)
+ */
+void phi_1(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used) {
+    for (int i = d; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            for (int k = j + 2; k < n; k++) {
+                vec<Lit> ps;
+                ps.push(~mkLit(compVars[comparator(i, j, k)]));
+                for (int i2 = i + 1; i2 < d; i2++) {
+                    ps.push(mkLit(used[make_pair(i2, j)]));
+                    ps.push(mkLit(used[make_pair(i2, k)]));
+                }
+                s.addClause(ps);
+            }
+        }
+    }
+}
+
+/******************************************************************************
+ * Add constraint phi_3 to the formula (see the article for more details)
+ */
+void phi_3(Solver &s, int n, int d, map<comparator, Var> &compVars) {
+    for (int i = 0; i < n - 3; i++) {
+        vec<Lit> ps;
+        ps.push(~mkLit(compVars[comparator(d - 2, i, i + 3)]));
+        ps.push(mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        s.addClause(ps);
+        ps.clear();
+        ps.push(~mkLit(compVars[comparator(d - 2, i, i + 3)]));
+        ps.push(mkLit(compVars[comparator(d - 1, i + 2, i + 3)]));
+        s.addClause(ps);
+        ps.clear();
+    }
+}
+
+/******************************************************************************
+ * Add constraint phi_4 to the formula (see the article for more details)
+ */
+void phi_4(Solver &s, int n, int d, map<comparator, Var> &compVars) {
+    for (int i = 0; i < n - 2; i++) {
+        vec<Lit> ps;
+        ps.push(~mkLit(compVars[comparator(d - 2, i, i + 2)]));
+        ps.push(mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(mkLit(compVars[comparator(d - 1, i + 1, i + 2)]));
+        s.addClause(ps);
+    }
+}
+
+/******************************************************************************
+ * Add constraint psi_1 to the formula (see the article for more details)
+ */
+void psi_1(Solver &s, int n, int d, map<pair<int, int>, Var> &used) {
+    for (int i = 0; i < n - 1; i++) {
+        vec<Lit> ps;
+        ps.push(mkLit(used[make_pair(d - 1, i)]));
+        ps.push(mkLit(used[make_pair(d - 1, i + 1)]));
+        s.addClause(ps);
+    }
+}
+
+/******************************************************************************
+ * Add constraint psi_2a to the formula (see the article for more details)
+ */
+void psi_2a(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used) {
+    for (int i = 0; i < n - 3; i++) {
+        vec<Lit> ps;
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(~mkLit(compVars[comparator(d - 1, i + 2, i + 3)]));
+        ps.push(mkLit(used[make_pair(d - 2, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 2)]));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(~mkLit(compVars[comparator(d - 1, i + 2, i + 3)]));
+        ps.push(mkLit(used[make_pair(d - 2, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 3)]));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(~mkLit(compVars[comparator(d - 1, i + 2, i + 3)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 1)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 2)]));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(~mkLit(compVars[comparator(d - 1, i + 2, i + 3)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 1)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 3)]));
+        s.addClause(ps);
+        ps.clear();
+    }
+}
+
+/******************************************************************************
+ * Add constraint psi_2b to the formula (see the article for more details)
+ */
+void psi_2b(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used) {
+    for (int i = 0; i < n - 2; i++) {
+        vec<Lit> ps;
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(mkLit(used[make_pair(d - 1, i + 2)]));
+        ps.push(mkLit(used[make_pair(d - 2, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 2)]));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(mkLit(used[make_pair(d - 1, i + 2)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 1)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 2)]));
+        s.addClause(ps);
+    }
+}
+
+/******************************************************************************
+ * Add constraint psi_2c to the formula (see the article for more details)
+ */
+void psi_2c(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used) {
+    for (int i = 0; i < n - 2; i++) {
+        vec<Lit> ps;
+        ps.push(~mkLit(compVars[comparator(d - 1, i + 1, i + 2)]));
+        ps.push(mkLit(used[make_pair(d - 1, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 1)]));
+        s.addClause(ps);
+        ps.clear();
+
+        ps.push(~mkLit(compVars[comparator(d - 1, i + 1, i + 2)]));
+        ps.push(mkLit(used[make_pair(d - 1, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 2)]));
+        s.addClause(ps);
+    }
+}
+
+/******************************************************************************
+ * Add constraint psi_3a to the formula (see the article for more details)
+ */
+void psi_3a(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used) {
+    for (int i = 0; i < n - 2; i++) {
+        vec<Lit> ps;
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(mkLit(used[make_pair(d - 1, i + 2)]));
+        ps.push(mkLit(used[make_pair(d - 2, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 1)]));
+        s.addClause(ps);
+    }
+}
+
+/******************************************************************************
+ * Add constraint psi_3b to the formula (see the article for more details)
+ */
+void psi_3b(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used) {
+    for (int i = 1; i < n - 1; i++) {
+        vec<Lit> ps;
+        ps.push(~mkLit(compVars[comparator(d - 1, i, i + 1)]));
+        ps.push(mkLit(used[make_pair(d - 1, i - 1)]));
+        ps.push(mkLit(used[make_pair(d - 2, i)]));
+        ps.push(mkLit(used[make_pair(d - 2, i + 1)]));
+        s.addClause(ps);
+    }
+}
+
+/******************************************************************************
+ * Create a formula for a feasible comparator network. 
+ * This can be extended to restrict the network in severals ways.
+ */
+void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used,
+                          Var &T, Var &F) {
+    T = s.newVar();
+    vec<Lit> units;
+    units.push(mkLit(T));
+    s.addClause(units);
+    units.clear();
+    F = s.newVar();
+    units.push(~mkLit(F));
+    s.addClause(units);
+    units.clear();
+    // create a variable for each possible comparator: 
+    int minV = 0xFFFFFF;
+    int maxV = 0;
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            for (int k = j + 1; k < n; k++) {
+                Var v = s.newVar();
+                minV = min(minV, v);
+                maxV = max(maxV, v);
+                compVars[comparator(i, j, k)] = v;
+            }
+        }
+    }
+
+    once(s, n, d, compVars);
+    createUsedVariables(s, n, d, compVars, used);
+    createConstraintsForLength1Comparators(s, n, d, compVars);
+
+    /********************************************************************
+    * Create first layer (cf. the paper :) )
+    */
+
+    bool fixFirst = optfixFirstLayer;
+    int maxFixedPrefLayer = -1;
+    if (opt_prefLayer) {
+        const char *_prefFileName = prefFileName ? (const char *) prefFileName : "layers.txt";
+        printf("Reading input from %s\n", _prefFileName);
+        vector<comparator> secondlayer;
+        parseSecondlayer(secondlayer, _prefFileName, opt_row);
+        // if nothing was read, try "Parberry" first layer
+        if (secondlayer.size() == 0) {
+            for (int i = 0; i < n; i += 2) {
+                if (i + 1 < n) {
+                    vec<Lit> ps;
+                    ps.push(mkLit(compVars[comparator(0, i, i + 1)]));
+                    s.addClause(ps);
+                }
+            }
+        }
+        // Remember which wires are used in which layer. 
+        // In case a wire is not used, forbid adding a comparator to it
+        set<pair<int, int> > usedWiresInLayer;
+        int highestLayerInFile = 0;
+        for (vector<comparator>::iterator it = secondlayer.begin(); it != secondlayer.end(); it++) {
+            vec<Lit> ps;
+            usedWiresInLayer.insert(make_pair(it->layer, it->minchan));
+            usedWiresInLayer.insert(make_pair(it->layer, it->maxchan));
+            ps.push(mkLit(compVars[*it]));
+            s.addClause(ps);
+            ps.clear();
+            printf("Forcing %d: %d -> %d\n", it->layer, it->minchan, it->maxchan);
+            highestLayerInFile = max(highestLayerInFile, it->layer);
+        }
+        maxFixedPrefLayer = highestLayerInFile;
+        printf("Setting maxFixedPrefLayer=%d\n", maxFixedPrefLayer);
+        for (int i = 0; i < d && i <= highestLayerInFile; i++) {
+            for (int j = 0; j < n; j++) {
+                if (usedWiresInLayer.count(make_pair(i, j)) == 0) {
+                    vec<Lit> ps;
+                    ps.push(~mkLit(used[make_pair(i, j)]));
+                    s.addClause(ps);
+                    printf("Forcing used[%d,%d]=false  (%d, %d)\n", i, j, used[make_pair(i, j)], ps.size());
+                }
+            }
+        }
+    } else if (fixFirst) {
+
+        printf("Adding BZ-style first vector...\n");
+        for (int j = 0; j < n - j - 1; j++) {
+            vec<Lit> ps;
+            ps.push(mkLit(compVars[comparator(0, j, n - j - 1)]));
+            s.addClause(ps);
+        }
+        maxFixedPrefLayer = 0;
+    }
+
+    if (opt_lastLayerConstraints) {
+        vec<Lit> ps;
+        onlyShortComparatorsInLastLayer(s, n, d, compVars, ps);
+        phi_1(s, n, d, compVars, used);
+        phi_3(s, n, d, compVars);
+        phi_4(s, n, d, compVars);
+        psi_1(s, n, d, used);
+        psi_2a(s, n, d, compVars, used);
+        psi_2b(s, n, d, compVars, used);
+        psi_2c(s, n, d, compVars, used);
+        psi_3a(s, n, d, compVars, used);
+        psi_3b(s, n, d, compVars, used);
+
+        // Redundantly add the following constraint:
+        // If there is a comparator (l, i, j) and both used(l+1, i) and (l+1, j) are false, add a comparator there
+        for (int l = 2; l < d - 2; l++) {
+            for (int i = 0; i < n; i++) {
+                for (int j = i + 1; j < n; j++) {
+                    ps.push(~mkLit(compVars[comparator(l, i, j)]));
+                    ps.push(mkLit(used[make_pair(l + 1, i)]));
+                    ps.push(mkLit(used[make_pair(l + 1, j)]));
+                    s.addClause(ps);
+                    ps.clear();
+                }
+            }
+        }
+    }
+
+}
+
+
+void addOneFromToRange(Solver &s, int layer, int from, int to, map<comparator, Var> &compVars,
+                       map<comparator, Var> &rangeVars) {
+
+    assert(rangeVars.find(comparator(layer, from, to)) == rangeVars.end());
+
+    vec<Lit> ps;
+    if (from < to) {
+        if (from == to - 1) {
+            rangeVars[comparator(layer, from, to)] = compVars[comparator(layer, from, to)];
+        } else {
+            Var v = s.newVar();
+            for (int i = from + 1; i <= to; i++) {
+                ps.push(mkLit(compVars[comparator(layer, from, i)]));
+            }
+            addEqual(s, v, ps);
+            rangeVars[comparator(layer, from, to)] = v;
+        }
+    } else {
+        if (from == to + 1) {
+            rangeVars[comparator(layer, from, to)] = compVars[comparator(layer, to, from)];
+        } else {
+            Var v = s.newVar();
+            for (int i = to; i < from; i++) {
+                ps.push(mkLit(compVars[comparator(layer, i, from)]));
+            }
+            addEqual(s, v, ps);
+            rangeVars[comparator(layer, from, to)] = v;
+        }
+    }
+
+}
+
+/******************************************************************************
+ * Create the clauses corresponding to an input-vector using the improved encoding
+ * presented in the article.
+ */
+void addInputImprovedEncoding(Solver &s, vector<bool> &newInput, int n, int d, triVarMap &compVarsInCreatedNW,
+                              map<pair<int, int>, Var> &used, Var &T, Var &F, triVarMap &intVars,
+                              triVarMap &rangeVars) {
+    vector<bool> newOutput;
+    static int calls = 0;
+    calls++;
+    map<pair<int, int>, Var> newInternalVars;
+    int zeros = 0;
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        if (!newInput[i]) {
+            zeros++;
+        }
+    }
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        newOutput.push_back(i < zeros ? false : true);
+    }
+    int leadingZeros = 0;
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        if (newInput[i])
+            break;
+        else
+            leadingZeros++;
+    }
+    int tailingOnes = 0;
+    for (unsigned i = newInput.size() - 1; i >= 0; i--) {
+        if (!newInput[i])
+            break;
+        else {
+            tailingOnes++;
+        }
+    }
+    // Create new internal variables
+    for (int i = 0; i < d - 1; i++) {
+        for (int j = 0; j < n; j++) {
+            if (j < leadingZeros) {
+                newInternalVars[make_pair(i, j)] = F;
+                intVars.insert(make_pair(comparator(calls, i, j), F));
+            } else if (j >= n - tailingOnes) {
+                newInternalVars[make_pair(i, j)] = T;
+                intVars.insert(make_pair(comparator(calls, i, j), T));
+            } else {
+                Var v = s.newVar();
+                newInternalVars[make_pair(i, j)] = v;
+                intVars.insert(make_pair(comparator(calls, i, j), v));
+            }
+        }
+    }
+    // Add input- and output-variables: 
+    for (int j = 0; j < n; j++) {
+        newInternalVars[make_pair(-1, j)] = newInput[j] ? T : F;
+        assert(newInternalVars.count(make_pair(d - 1, j)) == 0);
+        newInternalVars[make_pair(d - 1, j)] = newOutput[j] ? T : F;
+    }
+    // Add update-rules: 
+    for (int i = 0; i < d; i++) {
+        for (int j = leadingZeros; j < (n - tailingOnes); j++) {
+            // Let us assume that the value on this channel is "1". 
+            // Thus, this will stay unless there is a comparator down inside the window,
+            // and the other input is "0". 
+            vec<Lit> ps;
+            // If none of the comparators to higher indices is used...
+            if (rangeVars.count(comparator(i, j, n - tailingOnes - 1)) == 0) {
+                addOneFromToRange(s, i, j, n - tailingOnes - 1, compVarsInCreatedNW, rangeVars);
+            }
+            ps.push(mkLit(rangeVars[comparator(i, j, n - tailingOnes - 1)]));
+            // And the input is "1"
+            ps.push(~mkLit(newInternalVars[make_pair(i - 1, j)]));
+            // Then, the output is "1"
+            ps.push(mkLit(newInternalVars[make_pair(i, j)]));
+            s.addClause(ps);
+            ps.clear();
+
+            // Not let us assume there is a comparator to a higher index. 
+            // This, this "1" will disappear if the other input is a "0"
+            for (int k = j + 1; k < n - tailingOnes; k++) {
+                // If the other input is "0"...
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, j, k)]));
+                ps.push(mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+                // If both inputs equal "1"
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, j, k)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i - 1, j)]));
+                ps.push(mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+            }
+            // What if the input is "0"? 
+            // No comparator to lower indices -> output will be zero
+            if (rangeVars.count(comparator(i, j, leadingZeros)) == 0) {
+                addOneFromToRange(s, i, j, leadingZeros, compVarsInCreatedNW, rangeVars);
+            }
+            ps.push(mkLit(rangeVars[comparator(i, j, leadingZeros)]));
+
+            ps.push(mkLit(newInternalVars[make_pair(i - 1, j)]));
+            ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
+            s.addClause(ps);
+            ps.clear();
+            for (int k = leadingZeros; k < j; k++) {
+                // Comparator chosen, and other value="1" -> swap
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, k, j)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+
+                // Comparator chosen, and other value="0" -> still "0"
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, k, j)]));
+                ps.push(mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(mkLit(newInternalVars[make_pair(i - 1, j)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+            }
+        }
+    }
+}
+
+/******************************************************************************
+ * Create the clauses for an input vecotr using the "old" encoding, due to Bundala and Zavodny.
+ */
+void addInputOldEncoding(Solver &s, vector<bool> &newInput, int n, int d, triVarMap &compVarsInCreatedNW,
+                         map<pair<int, int>, Var> &used, Var &T, Var &F, triVarMap &intVars) {
+    int nbBefore = s.nVars();
+    int freeVarsBefore = s.nFreeVars();
+    vector<bool> newOutput;
+    static int calls = 0;
+    calls++;
+    map<pair<int, int>, Var> newInternalVars;
+    int zeros = 0;
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        if (!newInput[i]) {
+            zeros++;
+        }
+    }
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        newOutput.push_back(i < zeros ? false : true);
+    }
+    int leadingZeros = 0;
+    for (int i = 0; i < newInput.size(); i++) {
+        if (newInput[i])
+            break;
+        else
+            leadingZeros++;
+    }
+    int tailingOnes = 0;
+    for (unsigned i = newInput.size() - 1; i >= 0; i--) {
+        if (!newInput[i])
+            break;
+        else {
+            tailingOnes++;
+        }
+    }
+    // Create new internal variables
+    for (unsigned i = 0; i < d - 1; i++) {
+        for (int j = 0; j < n; j++) {
+            Var v = s.newVar();
+            newInternalVars[make_pair(i, j)] = v;
+            intVars.insert(make_pair(comparator(calls, i, j), v));
+        }
+    }
+    // add input and output-variables
+    for (int j = 0; j < n; j++) {
+        newInternalVars[make_pair(-1, j)] = newInput[j] ? T : F;
+        assert(newInternalVars.count(make_pair(d - 1, j)) == 0);
+        newInternalVars[make_pair(d - 1, j)] = newOutput[j] ? T : F;
+    }
+
+    // add update-rules: 
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            if (i < d - 1 && j < leadingZeros) {
+                vec<Lit> ps;
+                ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+            } else if (i < d - 1 && j >= n - tailingOnes) {
+                vec<Lit> ps;
+                ps.push(mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+            }
+            // not used -> copy
+            add_a_implies_b_equal_c(s, ~mkLit(used[make_pair(i, j)]),
+                                    mkLit(i > 0 ? newInternalVars[make_pair(i - 1, j)] : newInput[j] ? T : F),
+                                    mkLit(i < d - 1 ? newInternalVars[make_pair(i, j)] : newOutput[j] ? T : F));
+            for (int k = j + 1; k < n; k++) {
+                add_a_implies_b_equal_c_or_d(s, compVarsInCreatedNW[comparator(i, j, k)],
+                                             i < d - 1 ? newInternalVars[make_pair(i, k)] : newOutput[k] ? T : F,
+                                             i > 0 ? newInternalVars[make_pair(i - 1, k)] : newInput[k] ? T : F,
+                                             i > 0 ? newInternalVars[make_pair(i - 1, j)] : newInput[j] ? T : F);
+                add_a_implies_b_equal_c_and_d(s, compVarsInCreatedNW[comparator(i, j, k)],
+                                              i < d - 1 ? newInternalVars[make_pair(i, j)] : newOutput[j] ? T : F,
+                                              i > 0 ? newInternalVars[make_pair(i - 1, k)] : newInput[k] ? T : F,
+                                              i > 0 ? newInternalVars[make_pair(i - 1, j)] : newInput[j] ? T : F);
+            }
+        }
+    }
+
+    int nbAfter = s.nVars();
+    printf("\n");
+    for (int i = 0; i < newInput.size(); i++) {
+        printf("%d ", newInput[i] ? 1 : 0);
+    }
+
+    s.verbosity = 0;
+    for (map<pair<int, int>, Var>::reverse_iterator it = newInternalVars.rbegin(); it != newInternalVars.rend(); it++) {
+        s.checkLiteral(mkLit(it->second));
+        s.checkLiteral(~mkLit(it->second));
+    }
+    s.verbosity = 1;
+
+    int zerosInWindow = zeros - leadingZeros;
+    int onesInWindow = n - zeros - tailingOnes;
+    printf("In windows: %d zeros, %d ones\n", zerosInWindow, onesInWindow);
+    printf("And %d more free vars\n", s.nFreeVars() - freeVarsBefore);
+    printf("\nleading zeros: %d, tailing ones: %d (%d-%d)\n", leadingZeros, tailingOnes, nbBefore, nbAfter);
+}
+
+struct testInput {
+    int input;
+    int outPutOfPrefix;
+    int leadingZeros;
+    int tailingOnes;
+    int windowSize;
+
+    testInput(int _in, int _out, int _lead, int _tail, int _size) {
+        input = _in;
+        outPutOfPrefix = _out;
+        leadingZeros = _lead;
+        tailingOnes = _tail;
+        windowSize = _size;
+    }
+};
+
+bool isSmallerInput(const testInput &ti1, const testInput &ti2) {
+    // Inputs of small window size first
+    if (ti1.windowSize != ti2.windowSize) {
+        return ti1.windowSize < ti2.windowSize;
+    }
+    // If the window sizes are equal, try to choose input for the middle of the network
+    // This is, we multiply the number of leading zeros, and tailing ones
+    // 
+    int c1 = ti1.leadingZeros * ti1.tailingOnes;
+    int c2 = ti2.leadingZeros * ti2.tailingOnes;
+    if (c1 != c2) {
+        return c1 > c2;
+    }
+    // Assume that there is only one "input" for each "output"
+    return ti1.outPutOfPrefix < ti2.outPutOfPrefix;
+}
+
+bool isSet(int val, int bit) {
+    return val & (1 << bit);
+}
+
+int getNumUnsorted(int val, int n) {
+    int leadingZeros = 0, nZeros = 0;
+    int tailingOnes = 0, nOnes = 0;
+    while (leadingZeros < n && !isSet(val, leadingZeros))
+        leadingZeros++;
+    while (tailingOnes < n && isSet(val, n - tailingOnes - 1))
+        tailingOnes++;
+
+    for (int i = 0; i < n; i++) {
+        if (isSet(val, i))
+            nOnes++;
+        else
+            nZeros++;
+    }
+    return min(nZeros - leadingZeros, nOnes - tailingOnes);
+}
+
+
+/**********************************************************************
+ * Initialize the solver with some inputs.
+ * */
+void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int d,
+                   map<comparator, Var> &compVarsInCreatedNW, map<pair<int, int>, Var> &used, Var &T, Var &F,
+                   map<comparator, Var> &intVars, int k, triVarMap &rangeVars) {
+
+    // intputs with k leading zeros
+    int added = 0;
+    printf("Window size: %d\n", n - k);
+    map<comparator, Var> internalVars;
+    // map: Input -> Vector after first two layers
+    map<int, int> inputsToAdd;
+
+    printf("Creating inputs, read %d comparators from file\n", compsReadFromFile.size());
+    // Small change: Get ALL possible outputs of the prefix here
+    for (int i = 0; i < (1 << n); i++) {
+        int unsorted = getNumUnsorted(i, n);
+
+        int tmpStuff = compsReadFromFile.size() == 0 ? evalParberry(i, n) : eval(i, compsReadFromFile);
+        // getRating : num of leading zeros + num of tailing ones
+
+
+        if (inputsToAdd.find(tmpStuff) == inputsToAdd.end()) {
+            inputsToAdd[tmpStuff] = i;
+        } else {
+            // Already found this vector AFTER the first two layers. What does the input for this look like?
+            if (getRating(i, n) > getRating(inputsToAdd[tmpStuff], n)) {
+                inputsToAdd[tmpStuff] = i;
+            }
+        }
+
+    }
+    vector<testInput> possibleInputs;
+    for (map<int, int>::iterator it = inputsToAdd.begin(); it != inputsToAdd.end(); it++) {
+        int _out = it->first;
+        int _in = it->second;
+        int _lead = getNumLeadingZeros(_out, n);
+        int _tail = getNumTailingOnes(_out, n);
+
+        testInput t1(_in, _out, _lead, _tail, n - (_lead + _tail));
+        possibleInputs.push_back(t1);
+
+    }
+    sort(possibleInputs.begin(), possibleInputs.end(), isSmallerInput);
+
+    int windowSize2Add = n - k;
+    int toAdd = opt_minNumInputs;
+    printf("Starting to add inputs, windowSize2Add=%d, opt_minNumInputs=%d\n", windowSize2Add, toAdd);
+    printf("Chose %d out of %d\n", possibleInputs.size(), inputsToAdd.size());
+    for (vector<testInput>::iterator it = possibleInputs.begin(); it != possibleInputs.end(); it++) {
+        if (it->windowSize > windowSize2Add && added >= toAdd)
+            break;
+        if (it->windowSize > 0) {
+            // Skip sorted inputs
+            vector<bool> inputs;
+            for (int j = 0; j < n; j++) {
+                inputs.push_back((it->input & (1 << j)) != 0);
+            }
+
+            if (opt_optEncoding) {
+                addInputImprovedEncoding(s, inputs, n, d, compVarsInCreatedNW, used, T, F, intVars, rangeVars);
+            } else {
+                addInputOldEncoding(s, inputs, n, d, compVarsInCreatedNW, used, T, F, intVars);
+            }
+            added++;
+        }
+    }
+
+    printf("Added %d inputs\n", added);
+    bool fCheckDone = false;
+    while (!fCheckDone) {
+        int freeBefore = s.nFreeVars();
+        s.failedLiteralCheck();
+        fCheckDone = s.nFreeVars() == freeBefore;
+    }
+    s.toDimacs("formula.cnf");
+}
+
+bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
+
+    s.failedLiteralCheck();
+    if (iteration >= 0) {
+        double t_failed = cpuTime();
+        // Use failed literal check less often if solutions are counted...
+        if (iteration % 10 == 1 && (!false || iteration < 1000)) {
+
+            s.failedLiteralCheck();
+            printf("Failed literal check took %5.3lf s\n", cpuTime() - t_failed);
+        }
+    }
+
+    bool done = false;
+    bool netWorkCreated = false;
+    while (!done) {
+        s.budgetForRandom = 0;
+        bool solved = s.solve(allAssumptions);
+        if (solved) {
+            done = true;
+            netWorkCreated = true;
+        } else if (allAssumptions.size() == 0) {
+            done = true;
+        } else {
+            printf("Assumptions failed, removing one. Now: %d assumptions remaining\n", allAssumptions.size());
+            allAssumptions.pop();
+            s.addClause(s.conflict);
+        }
+    }
+    return netWorkCreated;
+}
+
+bool findFeasibleNetwork(Solver &s, int iteration) {
+    vec<Lit> emptyAssumptions;
+    return findFeasibleNetwork(s, iteration, emptyAssumptions);
+}
+
+
+/**********************************************
+ * Try to find a counter-example of minimum size. 
+ * This version is quite dumb and tries ALL O(n^2) possibilities...
+ * */
+bool findMinSizeCounterExample(Solver &s, vec<Lit> &assumptions, vector<Var> &inputVars, vector<bool> &bestInput, int n,
+                               map<pair<int, int>, Var> &innerVars) {
+    int bestRating = n + 1;
+    bool counterExampleFound = false;
+    int iterations = 0;
+    for (int lead = 0; lead < n; lead++) {
+        for (int tail = 0; tail < n && lead + tail < n; tail++) {
+            if (n - (tail + lead) > bestRating)
+                continue;
+            iterations++;
+            vec<Lit> allAssumptions;
+            for (int i = 0; i < assumptions.size(); i++) {
+                allAssumptions.push(assumptions[i]);
+            }
+            bool useInnerVars = false;
+            if (useInnerVars) {
+                // push "lead" nums of zeros
+                for (int i = 0; i < lead; i++)
+                    allAssumptions.push(~mkLit(innerVars[make_pair(1, i)]));
+                for (int i = 0; i < tail; i++)
+                    allAssumptions.push(mkLit(innerVars[make_pair(1, n - i - 1)]));
+            } else {
+                // push "lead" nums of zeros
+                for (int i = 0; i < lead; i++)
+                    allAssumptions.push(~mkLit(inputVars[i]));
+                for (int i = 0; i < tail; i++)
+                    allAssumptions.push(mkLit(inputVars[n - i - 1]));
+            }
+            bool solved = s.solve(allAssumptions);
+            if (solved) {
+                /* What is the rating of this? */
+                int ws;
+                if (useInnerVars) {
+                    int l = 0;
+                    while (l < n && s.modelValue(innerVars[make_pair(1, l)]) == l_False)
+                        l++;
+                    int t = 0;
+                    while (t < n && s.modelValue(innerVars[make_pair(1, n - t - 1)]) == l_True)
+                        t++;
+                    ws = n - (l + t);
+                } else {
+                    int l = 0;
+                    while (l < n && s.modelValue(inputVars[l]) == l_False)
+                        l++;
+                    int t = 0;
+                    while (t < n && s.modelValue(inputVars[n - t - 1]) == l_True)
+                        t++;
+                    ws = n - (l + t);
+                }
+                if (ws < bestRating) {
+                    bestRating = ws;
+                    bestInput.clear();
+                    for (int i = 0; i < inputVars.size(); i++) {
+                        bestInput.push_back(s.model[inputVars[i]] == l_True);
+                    }
+                }
+                counterExampleFound = true;
+            }
+        }
+    }
+    return counterExampleFound;
+}
+
+bool findCounterExample(Solver &testSolver, Solver &creationSolver, map<comparator, Var> &compVarsInCreatedNW,
+                        map<comparator, Var> &compVarsInTestNW, int iteration, vector<Var> &inputVars,
+                        vector<Var> &outputVars, vector<bool> &newInput, int n, map<pair<int, int>, Var> &innerVars) {
+    vec<Lit> assumptions;
+    set<Var> test;
+    /* Copy the comparators of the given comparator network to the test network*/
+    for (map<comparator, Var>::iterator it = compVarsInCreatedNW.begin(); it != compVarsInCreatedNW.end(); it++) {
+        assert(compVarsInTestNW.count(it->first) > 0);
+        if (creationSolver.modelValue(it->second) == l_True) {
+            assumptions.push(mkLit(compVarsInTestNW[it->first]));
+        } else {
+            assumptions.push(~mkLit(compVarsInTestNW[it->first]));
+        }
+        test.insert(compVarsInTestNW[it->first]);
+    }
+
+    return findMinSizeCounterExample(testSolver, assumptions, inputVars, newInput, n, innerVars);
+
+}
+//=================================================================================================
+// Main:
+
+
+int main(int argc, char **argv) {
+    setbuf(stdout, NULL);
+    try {
+        setUsageHelp(
+                "USAGE: %s [options] <input-file> <result-output-file>\n\n  where input may be either in plain or gzipped DIMACS.\n");
+
+#if defined(__linux__)
+        fpu_control_t oldcw, newcw;
+        _FPU_GETCW(oldcw); newcw = (oldcw & ~_FPU_EXTENDED) | _FPU_DOUBLE; _FPU_SETCW(newcw);
+        printf("WARNING: for repeatability, setting FPU to use double precision\n");
+#endif
+        // Extra options:
+        //
+        IntOption verb("MAIN", "verb", "Verbosity level (0=silent, 1=some, 2=more).", 1, IntRange(0, 2));
+        IntOption cpu_lim("MAIN", "cpu-lim", "Limit on CPU time allowed in seconds.\n", INT32_MAX,
+                          IntRange(0, INT32_MAX));
+        IntOption mem_lim("MAIN", "mem-lim", "Limit on memory usage in megabytes.\n", INT32_MAX,
+                          IntRange(0, INT32_MAX));
+
+        IntOption inputBits("MAIN", "input-Bits", "Num input bits for comparator network.\n", 6,
+                            IntRange(0, INT32_MAX));
+        IntOption numComps("MAIN", "numComps", "Maximum no comparators allowed.\n", 100000, IntRange(0, INT32_MAX));
+        IntOption layers("MAIN", "layers", "Num layers for comparator network.\n", 8, IntRange(0, INT32_MAX));
+        IntOption opt_thres("MAIN", "threshold",
+                            "Threshold for initially forbidding some comparators in the last columns.\n", 0,
+                            IntRange(0, INT32_MAX));
+
+        BoolOption encodeAll("MAIN", "encodeAll", "Add all inputs immediately, and write formula", false);
+        BoolOption opt_reverse_inputs("MAIN", "revers", "Revert counterexample optimization", false);
+
+        parseOptions(argc, argv, true);
+
+        double initial_time = cpuTime();
+        const char *_prefFileName = prefFileName ? (const char *) prefFileName : "layers.txt";
+        /* 
+         * standard initialization
+         */
+        Solver S;
+        S.verbosity = verb;
+
+        solver = &S;
+        // Use signal handlers that forcibly quit until the solver will be able to respond to
+        // interrupts:
+        signal(SIGINT, SIGINT_exit);
+        signal(SIGXCPU, SIGINT_exit);
+
+        // Set limit on CPU-time:
+        if (cpu_lim != INT32_MAX) {
+            rlimit rl;
+            getrlimit(RLIMIT_CPU, &rl);
+            if (rl.rlim_max == RLIM_INFINITY || (rlim_t) cpu_lim < rl.rlim_max) {
+                rl.rlim_cur = cpu_lim;
+                if (setrlimit(RLIMIT_CPU, &rl) == -1)
+                    printf("WARNING! Could not set resource limit: CPU-time.\n");
+            }
+        }
+
+        // Set limit on virtual memory:
+        if (mem_lim != INT32_MAX) {
+            rlim_t new_mem_lim = (rlim_t) mem_lim * 1024 * 1024;
+            rlimit rl;
+            getrlimit(RLIMIT_AS, &rl);
+            if (rl.rlim_max == RLIM_INFINITY || new_mem_lim < rl.rlim_max) {
+                rl.rlim_cur = new_mem_lim;
+                if (setrlimit(RLIMIT_AS, &rl) == -1)
+                    printf("WARNING! Could not set resource limit: Virtual memory.\n");
+            }
+        }
+
+
+        int n = inputBits;
+        int d = layers;
+        double overAllTimeForNetworkCheck = 0.0;
+        double overAllTimeForNetworkCreation = 0.0;
+        printf("=========================================================\n");
+        printf("=== Looking for Sorting networks for %d bits with depth %d\n", n, d);
+
+        /******************************************************
+        * create a solver to compare two networks: 
+        */
+        Solver netWorksCompare;
+
+        // add reference network
+        vector<Var> inputVars;
+        vector<Var> outputVarsForRev;
+        vector<Var> outputVarsForTest;
+        map<pair<int, int>, Var> innerVars1;
+        map<pair<int, int>, Var> innerVars2;
+        map<comparator, Var> internalVarsInCreatedNW;
+        for (int i = 0; i < n; i++) {
+            inputVars.push_back(netWorksCompare.newVar());
+            outputVarsForRev.push_back(netWorksCompare.newVar());
+            outputVarsForTest.push_back(netWorksCompare.newVar());
+        }
+        assert(netWorksCompare.nVars() > 0);
+        printf("Vectors created, numVars=%d\n", netWorksCompare.nVars());
+        /* create a reference-network - in this case, it's simply an odd-even-sort */
+        createRefNetwork(netWorksCompare, inputVars, outputVarsForRev, n, n, innerVars1);
+        printf("First Network created, numVars=%d\n", netWorksCompare.nVars());
+
+        /* create a configurable network */
+        map<comparator, Var> compVarsInTestNW;
+        map<pair<int, int>, Var> internalTestVars;
+        createTestNetWork(netWorksCompare, inputVars, outputVarsForTest, n, d, compVarsInTestNW, internalTestVars);
+        //createRefNetwork(netWorksCompare, inputVars, outputVarsForTest, n, n, innerVars2);
+        printf("Second Network created, numVars=%d\n", netWorksCompare.nVars());
+        // create "atLeastOneDiffers"-Constraint: 
+        vector<Var> diffVars;
+        addAtLeastOneDiffers(netWorksCompare, outputVarsForRev, outputVarsForTest, diffVars);
+
+
+        printf("Got so far, numVars = %d\n", netWorksCompare.nVars());
+
+        /*************************************************************************************
+         * Create Solver and formula which create a network which sorts the given inputs
+         */
+
+        Solver netWorkCreate;
+        solver = &netWorkCreate;
+        netWorkCreate.verbosity = verb;
+        map<comparator, Var> rangeVars;
+        map<comparator, Var> compVarsInCreatedNW;
+        map<pair<int, int>, Var> used;
+        Var T, F;
+        map<Var, vector<Var> > inputVecs;
+        createNetWorkFormula(netWorkCreate, n, d, compVarsInCreatedNW, used, T, F);
+        netWorkCreate.verbosity = verb;
+        vector<comparator> compsReadFromFile;
+        /*******************************************************
+         * Add all inputs that are not equivalent modulo the first layers. 
+         */
+
+        {
+            bool done = false;
+            bool networkFound = false;
+            int iterations = 0;
+
+            vector<Var> varsIndicatingPrefix;
+
+            if (opt_someStartValues) {
+
+                if (opt_prefLayer) {
+                    parseSecondlayer(compsReadFromFile, _prefFileName, opt_row);
+                }
+                int maxLayerReadFromFile = -1;
+                for (vector<comparator>::iterator it = compsReadFromFile.begin(); it != compsReadFromFile.end(); it++) {
+                    maxLayerReadFromFile = std::max(maxLayerReadFromFile, it->layer);
+                }
+                printf("Max layer in input: %d\n", maxLayerReadFromFile);
+                addSomeInputs(netWorkCreate, compsReadFromFile, n, d, compVarsInCreatedNW, used, T, F,
+                              internalVarsInCreatedNW, shrinkGen, rangeVars);
+
+            }
+
+
+            int maxWindowSoFar = 1;
+
+            while (!done) {
+                // Create network
+                printf("\n\n================================================================================\n");
+                printf("Iteration %d\n", ++iterations);
+                printf("Internal vars: %d and %d\n", compVarsInCreatedNW.size(), compVarsInTestNW.size());
+                printf("looking for a feasible network: \n");
+                double t_ = cpuTime();
+
+                bool newNetWorkCreated = findFeasibleNetwork(netWorkCreate, iterations);
+
+                printf("Network Creation took %lf s\n", cpuTime() - t_);
+                overAllTimeForNetworkCreation += cpuTime() - t_;
+                if (!newNetWorkCreated) {
+                    printf("UNSAT\n");
+                    printf("networkCreate.okay()=%d\n", netWorkCreate.okay());
+                    printf("MaxWindowSize: %d\n", maxWindowSoFar);
+                    done = true;
+                } else {
+                    /* print this comparator network */
+                    for (int i = 0; i < d; i++) {
+                        for (int j = 0; j < n; j++) {
+                            for (int k = j + 1; k < n; k++) {
+                                assert(compVarsInCreatedNW.find(comparator(i, j, k)) != compVarsInCreatedNW.end());
+
+                                if (netWorkCreate.modelValue(compVarsInCreatedNW[comparator(i, j, k)]) == l_True) {
+                                    printf("%d-%d, ", j, k);
+                                }
+                            }
+                        }
+                        printf("\n");
+                    }
+                    vector<bool> newInput;
+                    bool counterExampleFound = findCounterExample(netWorksCompare, netWorkCreate, compVarsInCreatedNW,
+                                                                  compVarsInTestNW, iterations, inputVars,
+                                                                  outputVarsForTest, newInput, n, internalTestVars);
+
+                    if (counterExampleFound) {
+                        if (!opt_optEncoding) {
+                            addInputOldEncoding(netWorkCreate, newInput, n, d, compVarsInCreatedNW, used, T, F,
+                                                internalVarsInCreatedNW);
+                        } else {
+                            addInputImprovedEncoding(netWorkCreate, newInput, n, d, compVarsInCreatedNW, used, T, F,
+                                                     internalVarsInCreatedNW, rangeVars);
+                        }
+                    } else {
+                        done = true;
+                        networkFound = true;
+                        break;
+                    }
+                }
+            }
+            if (networkFound) {
+                /* Give a (ugly) latex-version of the network found*/
+                // plot lines: 
+                for (int i = 0; i < n; i++) {
+                    printf("\\draw[color=black] (%d,%d)--(%d,%d);\n", 0, i, d, i);
+                }
+                for (int i = 0; i < d; i++) {
+                    float found = 0;
+                    for (int j = 0; j < n; j++) {
+                        for (int k = j + 1; k < n; k++) {
+                            if (netWorkCreate.modelValue(compVarsInCreatedNW[comparator(i, j, k)]) == l_True) {
+                                printf("\\draw[color=black] (%f,%d) -- (%f,%d);\n", (float) (i) + found, j,
+                                       (float) (i) + found, k);
+                                found += 0.1;
+                            }
+                        }
+                    }
+                    printf("\n");
+                }
+                netWorkCreate.toDimacs("formula.cnf");
+            }
+        }
+        printf("time was %f s\n", cpuTime() - initial_time);
+
+        printf("Time spent in network creation: %lf\n", overAllTimeForNetworkCreation);
+        printf("==============================================\n");
+        printf("Comparator stats: \n");
+        printStats(netWorksCompare);
+        printf("==============================================\n");
+        printf("Network creation stats: \n");
+        printStats(netWorkCreate);
+        lbool ret = l_Undef;
+
+
+#ifdef NDEBUG
+        exit(ret == l_True ? 10 : ret == l_False ? 20 : 0);     // (faster than "return", which will invoke the destructor for 'Solver')
+#else
+        return (ret == l_True ? 10 : ret == l_False ? 20 : 0);
+#endif
+    } catch (OutOfMemoryException &) {
+        printf("===============================================================================\n");
+        printf("INDETERMINATE\n");
+        exit(0);
+    }
+}

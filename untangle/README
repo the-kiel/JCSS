@@ -1,0 +1,7 @@
+A small program implementing the simple evolutionary algorithm used to obtain the optimized representations of the
+2-layer prefixes.
+
+To compile: g++ -O3 -o prefix prefix.cpp
+To run: e.g. ./prefix pb6.txt 6 0
+        where 6 is the number of channels and 0 is the number of the lowest channel
+        (we number the channels starting with channel 0)

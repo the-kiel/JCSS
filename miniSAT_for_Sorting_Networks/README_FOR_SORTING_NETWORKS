@@ -1,0 +1,15 @@
+This is a cleaned version of the solver used for the experiments presented in the papers
+"New Bounds on Optimal Sorting Networks" and "Sorting Networks: to the End and Back Again".
+
+To use the solver, build this software like a normal minisat (see README file), and run
+
+./minisat -input-Bits=17 -layers=10 -usePrefFile -prefFile=test.txt -betterEncoding -row=0 -useSomeValues -shrink=0 
+for 
+  - running the solver on 17 channels
+  - allowing for 10 layers
+  - using a prefix read from a file
+  - this file is "test.txt"
+  - use the new improved encoding (the old one is available as well)
+  - take the prefix which is stored in row no. 0 in this file
+  - start with some initial values
+  - shrink the window size by 0, i.e. allow for all outputs of the prefix
