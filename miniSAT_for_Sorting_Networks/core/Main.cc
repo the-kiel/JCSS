@@ -51,6 +51,8 @@ static IntOption opt_row("MAIN", "row", "Row in File to use", 0, IntRange(0, INT
 static IntOption shrinkGen("MAIN", "shrink", "Shrink generated formula by this number of bits.\n", 0,
                            IntRange(0, INT32_MAX));
 static StringOption prefFileName("MAIN", "prefFile", "Name of prefix file");
+static BoolOption opt_create_splitter("MAIN", "splitter", "Create a network which only sorts inputs with n/2 ones", false);
+
 
 //=================================================================================================
 
@@ -299,6 +301,11 @@ void createRefNetwork(Solver &s, vector<Var> &inputVars, vector<Var> &outputVars
             addEquals(s, i > 0 ? varsInNetwork[i - 1][numBits - 1] : inputVars[numBits - 1],
                       i < numLayers - 1 ? varsInNetwork[i][numBits - 1] : outputVars[numBits - 1]);
         }
+    }
+    if(opt_create_splitter){
+        assert(numBits % 2 == 0);
+        s.addClause(~mkLit(outputVars[numBits/2 - 1]));
+        s.addClause(mkLit(outputVars[numBits/2 ]));
     }
 }
 
@@ -557,6 +564,16 @@ void createUsedVariables(Solver &s, int n, int d, map<comparator, Var> &compVars
     }
 }
 
+
+/*
+ * For the case of splitters, create a constraint that comparators in the last layer must range from the
+ * upper to the lower half of the network
+ * */
+
+void createConstraintsForLastSplitLayer(Solver &s, int n, int d, map<comparator, Var> &compVars){
+    printf("c TODO!!! \n");
+}
+
 /******************************************************************************
  * Every comparator of length 1 has to be used at least in one layer (cf. Knuth, TAOCP)
  */
@@ -763,7 +780,7 @@ void psi_3b(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<in
  * This can be extended to restrict the network in severals ways.
  */
 void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<int, int>, Var> &used,
-                          Var &T, Var &F) {
+                          Var &T, Var &F, bool createSplitModule) {
     T = s.newVar();
     vec<Lit> units;
     units.push(mkLit(T));
@@ -789,7 +806,11 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
 
     once(s, n, d, compVars);
     createUsedVariables(s, n, d, compVars, used);
-    createConstraintsForLength1Comparators(s, n, d, compVars);
+    if(!createSplitModule)
+        createConstraintsForLength1Comparators(s, n, d, compVars);
+    else{
+        createConstraintsForLastSplitLayer(s, n, d, compVars);
+    }
 
     /********************************************************************
     * Create first layer (cf. the paper :) )
@@ -850,6 +871,7 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
     }
 
     if (opt_lastLayerConstraints) {
+        assert(!createSplitModule);
         vec<Lit> ps;
         onlyShortComparatorsInLastLayer(s, n, d, compVars, ps);
         phi_1(s, n, d, compVars, used);
@@ -1189,6 +1211,13 @@ int getNumUnsorted(int val, int n) {
     return min(nZeros - leadingZeros, nOnes - tailingOnes);
 }
 
+int getNumOnes(int val, int n){
+    int ret = 0;
+    for(int i = 0 ; i <=n ; i++)
+        if (val & (1<<i))
+            ret++;
+    return ret;
+}
 
 /**********************************************************************
  * Initialize the solver with some inputs.
@@ -1207,18 +1236,21 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
     printf("Creating inputs, read %d comparators from file\n", compsReadFromFile.size());
     // Small change: Get ALL possible outputs of the prefix here
     for (int i = 0; i < (1 << n); i++) {
-        int unsorted = getNumUnsorted(i, n);
+        if(! opt_create_splitter || getNumOnes(i, n) == n/2){
 
-        int tmpStuff = compsReadFromFile.size() == 0 ? evalParberry(i, n) : eval(i, compsReadFromFile);
-        // getRating : num of leading zeros + num of tailing ones
+            int unsorted = getNumUnsorted(i, n);
+
+            int tmpStuff = compsReadFromFile.size() == 0 ? evalParberry(i, n) : eval(i, compsReadFromFile);
+            // getRating : num of leading zeros + num of tailing ones
 
 
-        if (inputsToAdd.find(tmpStuff) == inputsToAdd.end()) {
-            inputsToAdd[tmpStuff] = i;
-        } else {
-            // Already found this vector AFTER the first two layers. What does the input for this look like?
-            if (getRating(i, n) > getRating(inputsToAdd[tmpStuff], n)) {
+            if (inputsToAdd.find(tmpStuff) == inputsToAdd.end()) {
                 inputsToAdd[tmpStuff] = i;
+            } else {
+                // Already found this vector AFTER the first two layers. What does the input for this look like?
+                if (getRating(i, n) > getRating(inputsToAdd[tmpStuff], n)) {
+                    inputsToAdd[tmpStuff] = i;
+                }
             }
         }
 
@@ -1266,7 +1298,7 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
         s.failedLiteralCheck();
         fCheckDone = s.nFreeVars() == freeBefore;
     }
-    s.toDimacs("formula.cnf");
+    //s.toDimacs("formula.cnf");
 }
 
 bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
@@ -1427,6 +1459,7 @@ int main(int argc, char **argv) {
         BoolOption encodeAll("MAIN", "encodeAll", "Add all inputs immediately, and write formula", false);
         BoolOption opt_reverse_inputs("MAIN", "revers", "Revert counterexample optimization", false);
 
+
         parseOptions(argc, argv, true);
 
         double initial_time = cpuTime();
@@ -1522,7 +1555,7 @@ int main(int argc, char **argv) {
         map<pair<int, int>, Var> used;
         Var T, F;
         map<Var, vector<Var> > inputVecs;
-        createNetWorkFormula(netWorkCreate, n, d, compVarsInCreatedNW, used, T, F);
+        createNetWorkFormula(netWorkCreate, n, d, compVarsInCreatedNW, used, T, F, opt_create_splitter);
         netWorkCreate.verbosity = verb;
         vector<comparator> compsReadFromFile;
         /*******************************************************
@@ -1606,6 +1639,31 @@ int main(int argc, char **argv) {
                 }
             }
             if (networkFound) {
+                /* print output for the verifyer
+                 * */
+                printf("VERIFY %d\n", n);
+                int numComps = 0;
+                for (int i = 0; i < d; i++) {
+                    for (int j = 0; j < n; j++) {
+                        for (int k = j + 1; k < n; k++) {
+                            if (netWorkCreate.modelValue(compVarsInCreatedNW[comparator(i, j, k)]) == l_True) {
+                                numComps++;
+                            }
+                        }
+                    }
+                }
+                printf("VERIFY %d\n", numComps);
+                for (int i = 0; i < d; i++) {
+                    for (int j = 0; j < n; j++) {
+                        for (int k = j + 1; k < n; k++) {
+                            if (netWorkCreate.modelValue(compVarsInCreatedNW[comparator(i, j, k)]) == l_True) {
+                                printf("VERIFY %d %d\n", j, k);
+                            }
+                        }
+                    }
+                }
+
+
                 /* Give a (ugly) latex-version of the network found*/
                 // plot lines: 
                 for (int i = 0; i < n; i++) {
@@ -1613,12 +1671,12 @@ int main(int argc, char **argv) {
                 }
                 for (int i = 0; i < d; i++) {
                     float found = 0;
+                    printf("\\addtocounter{sncolumncounter}{1}\n");
                     for (int j = 0; j < n; j++) {
                         for (int k = j + 1; k < n; k++) {
                             if (netWorkCreate.modelValue(compVarsInCreatedNW[comparator(i, j, k)]) == l_True) {
-                                printf("\\draw[color=black] (%f,%d) -- (%f,%d);\n", (float) (i) + found, j,
-                                       (float) (i) + found, k);
-                                found += 0.1;
+                                printf("\\nodeconnection{ {%d,%d}}\n", n-j, n-k);
+
                             }
                         }
                     }
