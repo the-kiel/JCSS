@@ -773,7 +773,8 @@ bool Solver::checkLiteral(Lit p){
         
         confl = propagate();
         if(confl != CRef_Undef){
-            printf("got conflict, UNSAT\n");
+            printf("got conflict in checkLiteral, UNSAT\n");
+            ok = false;
             phase_saving = tmp;
             return false;
         }
@@ -861,6 +862,7 @@ bool Solver::failedLiteralCheck(){
                 confl = propagate();
                 if(confl != CRef_Undef){
                     printf("got conflict, UNSAT\n");
+                    ok = false;
                     phase_saving = phaseBefore;
                     return false;
                 }

@@ -1334,6 +1334,8 @@ bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
 }
 
 bool findFeasibleNetwork(Solver &s, int iteration) {
+    if(!s.okay())
+        return false;
     vec<Lit> emptyAssumptions;
     return findFeasibleNetwork(s, iteration, emptyAssumptions);
 }
@@ -1586,7 +1588,7 @@ int main(int argc, char **argv) {
 
 
             int maxWindowSoFar = 1;
-
+            printf("c starting loop,netWorkCreate.okay = %d\n", netWorkCreate.okay());
             while (!done) {
                 // Create network
                 printf("\n\n================================================================================\n");
