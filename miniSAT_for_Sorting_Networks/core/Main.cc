@@ -45,6 +45,8 @@ static BoolOption opt_prefLayer("MAIN", "usePrefFile", "Use a prefix file", fals
 static BoolOption opt_someStartValues("MAIN", "useSomeValues", "Add some values and continue iteratively", false);
 static BoolOption opt_lastLayerConstraints("MAIN", "lastLayerConstraints", "Use constraints on last layers", true);
 
+static BoolOption opt_lastLayerHC("MAIN", "llCleaner", "Use half cleaner as last layer", false);
+
 static BoolOption opt_optEncoding("MAIN", "betterEncoding", "Use faster encoding", false);
 static IntOption opt_minNumInputs("MAIN", "minNumInputs", "Minimum number of inputs to use", 0, IntRange(0, INT32_MAX));
 static IntOption opt_row("MAIN", "row", "Row in File to use", 0, IntRange(0, INT32_MAX));
@@ -571,6 +573,15 @@ void createUsedVariables(Solver &s, int n, int d, map<comparator, Var> &compVars
  * */
 
 void createConstraintsForLastSplitLayer(Solver &s, int n, int d, map<comparator, Var> &compVars){
+    for(int i = 0 ; i < n ; i++){
+        for(int j = i+1 ; j < n ; j++){
+            assert(compVars.count(comparator(d-1, i, j)));
+            if( j < n/2-1 || i >= n/2){
+                printf("c forbidding comparator %d -> %d in last layer! \n", i, j);
+                s.addClause(~mkLit(compVars[comparator(d-1, i, j)]));
+            }
+        }
+    }
     printf("c TODO!!! \n");
 }
 
@@ -895,6 +906,14 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
                     s.addClause(ps);
                     ps.clear();
                 }
+            }
+        }
+    }
+    else if(createSplitModule){
+        if(opt_lastLayerHC){
+            assert(n%2 == 0);
+            for(int i = 0 ; i < n / 2 ; i++){
+                s.addClause(mkLit(compVars[comparator(d-1, i, n-i-1)]));
             }
         }
     }

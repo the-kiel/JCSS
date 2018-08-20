@@ -72,6 +72,10 @@ public:
     
     void    asymmbranch  ();
     bool    failedLiteralCheck();
+    lbool   checkLearnts();
+    void    checkDuplicates();
+
+    void    mySubsumptionTest();
     bool    checkLiteral(Lit p);
     bool    findEquivalences();
     bool    checkAndAdd(vec<Lit>&ps);
@@ -156,6 +160,9 @@ public:
     void  lookahead(Var & v, bool & pol, int & numProps);
 
     void     reduceDB         ();                                                      // Reduce the set of learnt clauses.
+
+    unsigned int computeLBD(const vec<Lit> &c);
+    bool entailed(vec<Lit> & c);
 protected:
 
     // Helper structures:
@@ -192,6 +199,8 @@ protected:
     double              cla_inc;          // Amount to bump next clause with.
     vec<double>         activity;         // A heuristic measurement of the activity of a variable.
     double              var_inc;          // Amount to bump next variable with.
+    vec<int>            permDiff;
+    unsigned int        MYFLAG;
     OccLists<Lit, vec<Watcher>, WatcherDeleted>
                         watches;          // 'watches[lit]' is a list of constraints watching 'lit' (will go there if literal becomes true).
     vec<lbool>          assigns;          // The current assignments.
@@ -315,16 +324,15 @@ inline void Solver::varBumpActivity(Var v, double inc) {
 
 inline void Solver::claDecayActivity() { cla_inc *= (1 / clause_decay); }
 inline void Solver::claBumpActivity (Clause& c) {
-    c.setTTL(7);
         if ( (c.activity() += cla_inc) > 1e20 ) {
             // Rescale:
             bool written = false;
-            printf("Rescaling clause activities\n");
+            //printf("Rescaling clause activities\n");
             for (int i = 0; i < learnts.size(); i++){
                 ca[learnts[i]].activity() *= 1e-20;
                 if(ca[learnts[i]].activity() == 0.0 && !written){
-                    printf("Act dropped to 0.0\n");
-                    written = true;
+                    //printf("Act dropped to 0.0\n");
+                    //written = true;
                 }
             }
             cla_inc *= 1e-20; } }

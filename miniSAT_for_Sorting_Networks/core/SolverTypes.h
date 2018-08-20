@@ -127,9 +127,10 @@ class Clause {
         unsigned has_extra : 1;
         unsigned reloced   : 1;
         unsigned canBeDel  : 1;
-        unsigned TTL       : 3;
-        unsigned uses      : 8;
-        unsigned size      : 15; }                            header;
+        unsigned goodClause: 1;
+        unsigned wasChecked: 1;
+        unsigned checkPending: 1;
+        unsigned size      : 23; }                            header;
     union { Lit lit; float act; uint32_t abs; CRef rel; } data[0];
 
     friend class ClauseAllocator;
@@ -143,8 +144,9 @@ class Clause {
         header.reloced   = 0;
         header.size      = ps.size();
         header.canBeDel  = false;
-        header.TTL       = 7;
-        header.uses      = 0;
+        header.goodClause = false;
+        header.wasChecked = false;
+        header.checkPending = false;
         for (int i = 0; i < ps.size(); i++) 
             data[i].lit = ps[i];
 
@@ -175,15 +177,15 @@ public:
     void         mark        (uint32_t m)    { header.mark = m; }
     const Lit&   last        ()      const   { return data[header.size-1].lit; }
 
+    void        setGood(bool b) { header.goodClause = b; }
+    bool        isGoodClause() const { return header.goodClause; }
+
+    void        setChecked(bool b) { header.wasChecked = b; }
+    bool        wasChecked()    const { return header.wasChecked; }
+
     bool         reloced     ()      const   { return header.reloced; }
     CRef         relocation  ()      const   { return data[0].rel; }
     void         relocate    (CRef c)        { header.reloced = 1; data[0].rel = c; }
-    int          getTTL      ()      const   {return header.TTL;}
-    void         setTTL      (int ttl)       {header.TTL = ttl;}
-    void         reduceTTL   ()              { if(header.TTL > 0) header.TTL--; }
-    void         incTTL      ()              { if (header.TTL < 7) header.TTL++; }
-    void         incUses     ()              {header.uses++;}
-    int          getUses     ()              {return header.uses;}
     
 
     // NOTE: somewhat unsafe to change the clause in-place! Must manually call 'calcAbstraction' afterwards for
@@ -196,6 +198,7 @@ public:
     uint32_t     abstraction () const        { assert(header.has_extra); return data[header.size].abs; }
 
     Lit          subsumes    (const Clause& other) const;
+    Lit          subsumes_learnt (const Clause& other) const;
     void         strengthen  (Lit p);
 };
 
@@ -257,8 +260,10 @@ class ClauseAllocator : public RegionAllocator<uint32_t>
         // Copy extra data-fields: 
         // (This could be cleaned-up. Generalize Clause-constructor to be applicable here instead?)
         to[cr].mark(c.mark());
+        to[cr].setGood(c.isGoodClause());
         to[cr].setCanBeDel(c.canBeDel());
-        to[cr].setTTL(c.getTTL());
+        to[cr].setChecked(c.wasChecked());
+
         if (to[cr].learnt())         to[cr].activity() = c.activity();
         else if (to[cr].has_extra()) to[cr].calcAbstraction();
     }
@@ -387,6 +392,36 @@ inline Lit Clause::subsumes(const Clause& other) const
     assert(!header.learnt);   assert(!other.header.learnt);
     assert(header.has_extra); assert(other.header.has_extra);
     if (other.header.size < header.size || (data[header.size].abs & ~other.data[other.header.size].abs) != 0)
+        return lit_Error;
+
+    Lit        ret = lit_Undef;
+    const Lit* c   = (const Lit*)(*this);
+    const Lit* d   = (const Lit*)other;
+
+    for (unsigned i = 0; i < header.size; i++) {
+        // search for c[i] or ~c[i]
+        for (unsigned j = 0; j < other.header.size; j++)
+            if (c[i] == d[j])
+                goto ok;
+            else if (ret == lit_Undef && c[i] == ~d[j]){
+                ret = c[i];
+                goto ok;
+            }
+
+        // did not find it
+        return lit_Error;
+    ok:;
+    }
+
+    return ret;
+}
+
+inline Lit Clause::subsumes_learnt(const Clause& other) const
+{
+    //if (other.size() < size() || (extra.abst & ~other.extra.abst) != 0)
+    //if (other.size() < size() || (!learnt() && !other.learnt() && (extra.abst & ~other.extra.abst) != 0))
+
+    if (other.header.size < header.size)
         return lit_Error;
 
     Lit        ret = lit_Undef;

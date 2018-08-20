@@ -22,8 +22,12 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 
 #include "mtl/Sort.h"
 #include "core/Solver.h"
+#include "utils/System.h"
 
 #include <vector>
+#include <set>
+#include <algorithm>
+
 #include <ctime>
 using namespace Minisat;
 using namespace std;
@@ -103,6 +107,7 @@ Solver::Solver() :
   , propagation_budget (-1)
   , asynch_interrupt   (false)
   , budgetForRandom    (0)
+  , MYFLAG              (0)
 {}
 
 
@@ -131,6 +136,7 @@ Var Solver::newVar(bool sign, bool dvar)
     decision .push();
     trail    .capacity(v+1);
     setDecisionVar(v, dvar);
+    permDiff.push(0);
     return v;
 }
 
@@ -515,6 +521,19 @@ CRef Solver::propagate()
     return confl;
 }
 
+inline unsigned int Solver::computeLBD(const vec<Lit> &c) {
+    int nblevels = 0;
+    MYFLAG++;
+    for(int i=0;i<c.size();i++) {
+      int l = level(var(c[i]));
+      if (permDiff[l] != MYFLAG) {
+            permDiff[l] = MYFLAG;
+            nblevels++;
+        }
+    }
+
+  return nblevels;
+}
 
 /*_________________________________________________________________________________________________
 |
@@ -528,25 +547,268 @@ struct reduceDB_lt {
     ClauseAllocator& ca;
     reduceDB_lt(ClauseAllocator& ca_) : ca(ca_) {}
     bool operator () (CRef x, CRef y) { 
-        return (ca[x].canBeDel() && !ca[y].canBeDel()) || ca[x].size() > 2 && (ca[y].size() == 2 || ca[x].activity() < ca[y].activity()); }
+        return  ca[x].size() > 2 && (ca[y].size() == 2 || ca[x].activity() < ca[y].activity()); }
 };
 void Solver::reduceDB()
 {
     int     i, j;
     double  extra_lim = cla_inc / learnts.size();    // Remove any clause below this activity
     
-    sort(learnts, reduceDB_lt(ca));
+    //sort(learnts, reduceDB_lt(ca));
     // Don't delete binary or locked clauses. From the rest, delete clauses from the first half
     // and clauses with activity smaller than 'extra_lim':
     for (i = j = 0; i < learnts.size(); i++){
         Clause& c = ca[learnts[i]];
-        if (c.size() > 2 && !locked(c) && (i < learnts.size() / 2 || c.activity() < extra_lim))
+        if (c.size() > 2 && !locked(c) && c.canBeDel())
             removeClause(learnts[i]);
-        else
+        else{
             learnts[j++] = learnts[i];
+            if(!c.isGoodClause()){
+                c.setCanBeDel(true);
+            }
+        }
     }
     learnts.shrink(i - j);
+    printf("c reduce DB: %d -> %d clauses\n", i, j);
     checkGarbage();
+}
+
+struct size_lt {
+    ClauseAllocator& ca;
+    size_lt(ClauseAllocator& ca_) : ca(ca_) {}
+    bool operator () (CRef x, CRef y) {
+        return  ca[x].size() < ca[y].size() ; }
+};
+
+
+struct ClauseDeleted {
+    const ClauseAllocator& ca;
+    explicit ClauseDeleted(const ClauseAllocator& _ca) : ca(_ca) {}
+    bool operator()(const CRef& cr) const { return ca[cr].mark() == 1; } };
+
+void Solver::mySubsumptionTest(){
+    std::map<int, std::vector<CRef> > occurs;
+    std::map<int, int> nOcc;
+    for(int i = 0 ; i < learnts.size();i++){
+
+        Clause & c = ca[learnts[i]];
+        assert(!c.mark());
+        CRef cr = learnts[i];
+        for(int j = 0 ; j < c.size();j++){
+            occurs[var(c[j])].push_back(cr);
+            nOcc[var(c[j])] ++;
+        }
+    }
+    sort(learnts, size_lt(ca));
+    int subsumed = 0;
+    int couldBeShrinked=0;
+    int n = learnts.size();
+    std::vector<std::vector<int> > newClauses;
+    for(int i = 0 ; i < n;i++){
+        Clause & c = ca[learnts[i]];
+        if(!c.mark()){
+            Lit best = c[0];
+            for(int j = 0 ; j < c.size();j++)
+                if(occurs[var(c[j])].size() < occurs[var(best)].size())
+                    best = c[j];
+            const std::vector<CRef> & others = occurs[var(best)];
+            for(int j = 0 ; j < others.size();j++){
+                if(!ca[others[j]].mark() && others[j] != learnts[i]){
+                    Lit l = ca[learnts[i]].subsumes_learnt(ca[others[j]]);
+                    if(l == lit_Error){
+                        // Nothing???
+                    }
+                    else if(l == lit_Undef){
+                        subsumed++;
+                        ca[others[j]].mark(1);
+                    }
+                    else{
+                        couldBeShrinked++;
+                        std::vector<int> newC;
+                        for(int k = 0 ; k < ca[others[j]].size();k++)
+                            if(var(ca[others[j]][k]) != var(l))
+                                newC.push_back(toInt(ca[others[j]][k]));
+                        newClauses.push_back(newC);
+                        ca[others[j]].mark(1);
+                        /*vec<Lit> newClause;
+                        Clause & c2 = ca[others[j]];
+                        for(int k = 0 ; k < c2.size();k++)
+                            if(var(c2[k]) != var(l))
+                                newClause.push(c[k]);
+                        //printf("c c.size() %d c2.size() %d newClause.size() %d \n", c.size(), c2.size(), newClause.size());
+                        assert(c2.size() == newClause.size()+1);
+                        if(newClause.size() > 1){
+                            CRef cr = ca.alloc(newClause, true);
+
+                            learnts.push(cr);
+                            attachClause(cr);
+                            ca[cr].setGood(ca[others[j]].isGoodClause());
+                            ca[others[j]].mark(1);
+                        }
+                        else{
+                            printf("c got unit clause by subsumption check??? \n");
+                        }*/
+                    }
+                }
+            }
+        }
+    }
+
+    for(int i = 0 ; i < newClauses.size();i++){
+        vec<Lit> ps;
+        std::vector<int> & v = newClauses[i];
+        for(int j = 0 ; j < v.size();j++)
+            ps.push(toLit(v[j]));
+        if(ps.size() <= 1){
+            printf("c okay, found unit clause???\n");
+        }
+        assert(entailed(ps));
+        CRef cr = ca.alloc(ps, true);
+
+        learnts.push(cr);
+        attachClause(cr);
+    }
+    printf("c my subsumption test is done, have %d subsumed clauses and %d which can be shrinked\n", subsumed, couldBeShrinked);
+    int i=0;
+    int j = 0;
+    for (i = j = 0; i < learnts.size(); i++){
+        Clause& c = ca[learnts[i]];
+        if ( !locked(c) && c.mark())
+            removeClause(learnts[i]);
+        else{
+            learnts[j++] = learnts[i];
+            c.mark(0);
+        }
+    }
+    learnts.shrink(i - j);
+    printf("c after subsumption check DB: %d -> %d clauses\n", i, j);
+    checkGarbage();
+
+}
+
+bool clauseExists(Clause & ps, std::set<std::vector<int> > & seenSoFar){
+    std::vector<int> v;
+    for(int i = 0 ; i < ps.size();i++){
+        v.push_back(toInt(ps[i]));
+    }
+    std::sort(v.begin(), v.end());
+    if(seenSoFar.count(v))
+        return true;
+    seenSoFar.insert(v);
+    return false;
+}
+
+void Solver::checkDuplicates(){
+    std::set<std::vector<int> > duplicates;
+    int found = 0;
+    for(int i = 0 ; i < learnts.size();i++)
+        if(clauseExists(ca[learnts[i]], duplicates))
+            found++;
+    printf("c found %d duplicate clauses! \n", found);
+}
+
+/*
+ * Return whether the clause "c" is entailed by this formula by checking that unit-propagation on its negation yields a conflict
+ * */
+bool Solver::entailed(vec<Lit> & c){
+    assert(0 == decisionLevel());
+    int tsBefore = trail.size();
+    for(int i = 0 ; i < c.size();i++)
+        if(value(c[i]) == l_True){
+            return true; // propagating the negation will yield a conflict
+        }
+    newDecisionLevel();
+    for(int i = 0 ; i < c.size();i++){
+        if(value(c[i]) == l_Undef)
+            uncheckedEnqueue(~c[i]);
+    }
+    CRef confl = propagate();
+    bool ret = confl != CRef_Undef;
+    cancelUntil(0);
+    assert(trail.size() == tsBefore);
+    return ret;
+}
+
+lbool Solver::checkLearnts(){
+    assert(0 == decisionLevel());
+    int n = learnts.size();
+    printf("c check called! \n");
+    double tStart = cpuTime();
+    int checked = 0;
+    int numConfls = 0;
+    int numReduced = 0;
+    for(int i = 0 ; i < n ; i++){
+        Clause & c = ca[learnts[i]];
+
+        bool done = false;
+        if(c.isGoodClause() && !c.wasChecked()){
+            c.setChecked(true);
+            checked++;
+            for(int j = 0 ; j < c.size() && !done;j++){
+                if(value(c[j]) == l_Undef){
+                    newDecisionLevel();
+                    uncheckedEnqueue(~c[j]);
+                    CRef confl = propagate();
+                    if(confl != CRef_Undef){
+                        c.setCanBeDel(true);
+                        int         backtrack_level;
+                        vec<Lit>    learnt_clause;
+                        analyze(confl, learnt_clause, backtrack_level);
+                        numConfls++;
+                        if(backtrack_level == 0){
+                            printf("c got BT to DL 0! \n");
+                            cancelUntil(0);
+                            uncheckedEnqueue(learnt_clause[0]);
+                            confl = propagate();
+                            if(confl != CRef_Undef){
+                                printf("c got UNSAT \n");
+                                return l_False;
+                            }
+                        }
+                        else{
+                            CRef cr = ca.alloc(learnt_clause, true);
+                            learnts.push(cr);
+                            attachClause(cr);
+                            ca[cr].setGood(true);
+                        }
+                        done = true;
+                    }
+                }
+                else if(value(c[j]) == l_True){
+                    // Call analyseFinal here!
+                    vec<Lit>    learnt_clause;
+                    analyzeFinal(c[j], learnt_clause);
+                    if(learnt_clause.size() < c.size()){
+                        numReduced++;
+                        cancelUntil(0);
+                        assert(entailed(learnt_clause));
+                        CRef cr = ca.alloc(learnt_clause, true);
+                        if(learnt_clause.size() == 1){
+                            printf("c found unit clause! \n");
+                            if(value(learnt_clause[0]) == l_Undef){
+                                uncheckedEnqueue(learnt_clause[0]);
+                                CRef confl = propagate();
+                                if(confl != CRef_Undef){
+                                    printf("c got UNSAT \n");
+                                    return l_False;
+                                }
+                            }
+                        }
+                        else{
+                            learnts.push(cr);
+                            attachClause(cr);
+                            c.setCanBeDel(true);
+                            ca[cr].setGood(true);
+                        }
+                    }
+                    done = true;
+                }
+            }
+        }
+        cancelUntil(0);
+    }
+    printf("c checked %d clauses in time %lf had %d confls and %d lifts\n", checked, cpuTime() - tStart, numConfls, numReduced);
+    return l_Undef;
 }
 
 
@@ -635,7 +897,8 @@ lbool Solver::search(int nof_conflicts)
 
             learnt_clause.clear();
             analyze(confl, learnt_clause, backtrack_level);
-            
+
+            unsigned int LBD = computeLBD(learnt_clause);
             cancelUntil(backtrack_level);
             
             if (learnt_clause.size() == 1){
@@ -645,6 +908,8 @@ lbool Solver::search(int nof_conflicts)
                 learnts.push(cr);
                 attachClause(cr);
                 claBumpActivity(ca[cr]);
+                ca[cr].setGood(LBD <= 10);
+
                 uncheckedEnqueue(learnt_clause[0], cr);
             }
 
@@ -675,9 +940,9 @@ lbool Solver::search(int nof_conflicts)
             if (decisionLevel() == 0 && !simplify())
                 return l_False;
 
-            if (learnts.size()-nAssigns() >= max_learnts)
+            //if (learnts.size()-nAssigns() >= max_learnts)
                 // Reduce the set of learnt clauses:
-                reduceDB();
+              //  reduceDB();
 
             Lit next = lit_Undef;
             while (decisionLevel() < assumptions.size()){
@@ -941,6 +1206,8 @@ lbool Solver::solve_()
     conflict.clear();
     if (!ok) return l_False;
 
+    int delay_Checks = 50000;
+    int conflsNextCheck = delay_Checks;
     solves++;
     if(verbosity >= 1) 
         printf("Solve called, numVars()=%d, assigned at DL0: %d, num Clauses: %d, learnt clauses: %d\n", nVars(), trail.size(), clauses.size(), learnts.size());
@@ -963,6 +1230,19 @@ lbool Solver::solve_()
         status = search(rest_base * restart_first);
         if (!withinBudget()) break;
         curr_restarts++;
+        if(conflicts > conflsNextCheck){
+            lbool test = checkLearnts();
+            conflsNextCheck = conflicts + delay_Checks;
+            if(test == l_False){
+                status = l_False;
+            }
+            else{
+
+                //checkDuplicates();
+                mySubsumptionTest();
+                //reduceDB();
+            }
+        }
     }
 
     if (verbosity >= 1)
@@ -1065,6 +1345,7 @@ void Solver::toDimacs(FILE* f, const vec<Lit>& assumps)
 
 void Solver::relocAll(ClauseAllocator& to)
 {
+    printf("c reloc called! \n");
     // All watchers:
     //
     // for (int i = 0; i < watches.size(); i++)
