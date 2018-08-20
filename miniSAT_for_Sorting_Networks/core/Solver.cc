@@ -51,6 +51,7 @@ static IntOption     opt_restart_first     (_cat, "rfirst",      "The base resta
 static IntOption     opt_deletion_mode     (_cat, "delMode",      "Mode of deleting clauses (0=standard, 1=removeImplied, 2=old", 0, IntRange(0, 2));
 static DoubleOption  opt_restart_inc       (_cat, "rinc",        "Restart interval increase factor", 2, DoubleRange(1, false, HUGE_VAL, false));
 static DoubleOption  opt_garbage_frac      (_cat, "gc-frac",     "The fraction of wasted memory allowed before a garbage collection is triggered",  0.20, DoubleRange(0, false, HUGE_VAL, false));
+static IntOption     opt_ThresholdPermanent      (_cat, "threshPerm",  "Clauses with LBD at most this value will become permanent", 7, IntRange(0, INT32_MAX));
 
 //=================================================================================================
 // Constructor/Destructor:
@@ -61,6 +62,7 @@ Solver::Solver() :
     // Parameters (user settable):
     //
     verbosity        (0)
+  , nextPrintStats(10000)
   , var_decay        (opt_var_decay)
   , clause_decay     (opt_clause_decay)
   , random_var_freq  (opt_random_var_freq)
@@ -136,6 +138,7 @@ Var Solver::newVar(bool sign, bool dvar)
     decision .push();
     trail    .capacity(v+1);
     setDecisionVar(v, dvar);
+    permDiff.push(0);
     permDiff.push(0);
     return v;
 }
@@ -289,8 +292,11 @@ void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
         assert(confl != CRef_Undef); // (otherwise should be UIP)
         Clause& c = ca[confl];
 
-        if (c.learnt())
+        if (c.learnt()){
             claBumpActivity(c);
+            c.setCanBeDel(false);
+            // recompute LBD here???
+        }
 
         for (int j = (p == lit_Undef) ? 0 : 1; j < c.size(); j++){
             Lit q = c[j];
@@ -559,7 +565,7 @@ void Solver::reduceDB()
     // and clauses with activity smaller than 'extra_lim':
     for (i = j = 0; i < learnts.size(); i++){
         Clause& c = ca[learnts[i]];
-        if (c.size() > 2 && !locked(c) && c.canBeDel())
+        if (c.size() > 2 && !locked(c) && c.canBeDel() && c.activity() <= 0)
             removeClause(learnts[i]);
         else{
             learnts[j++] = learnts[i];
@@ -571,6 +577,31 @@ void Solver::reduceDB()
     learnts.shrink(i - j);
     printf("c reduce DB: %d -> %d clauses\n", i, j);
     checkGarbage();
+}
+
+Lit Solver::subsumes_faster    (Clause & c1, Clause & c2){
+
+    Lit ret = lit_Undef;
+    if(c1.size() > c2.size() ){
+        return lit_Error;
+    }
+
+
+    MYFLAG++;
+
+    // Mark all literals from c2
+    for(int i = 0 ; i < c2.size();i++)
+        permDiff[c2[i].x] = MYFLAG;
+    for(int i = 0 ; i < c1.size();i++){
+        if(permDiff[c1[i].x] != MYFLAG){
+            // So this literal is not in c2. Is its opposite literal in there?
+            if(ret == lit_Undef && permDiff[(~c1[i]).x] == MYFLAG)
+                ret = c1[i];
+            else
+                ret = lit_Error;
+        }
+    }
+    return ret;
 }
 
 struct size_lt {
@@ -587,6 +618,7 @@ struct ClauseDeleted {
     bool operator()(const CRef& cr) const { return ca[cr].mark() == 1; } };
 
 void Solver::mySubsumptionTest(){
+    double tStart = cpuTime();
     std::map<int, std::vector<CRef> > occurs;
     std::map<int, int> nOcc;
     for(int i = 0 ; i < learnts.size();i++){
@@ -604,17 +636,20 @@ void Solver::mySubsumptionTest(){
     int couldBeShrinked=0;
     int n = learnts.size();
     std::vector<std::vector<int> > newClauses;
+    std::vector<bool> goodClause;
+    int goodShrinked = 0;
     for(int i = 0 ; i < n;i++){
         Clause & c = ca[learnts[i]];
-        if(!c.mark()){
+        if(!c.mark() && !c.canBeDel() && c.isGoodClause()){
             Lit best = c[0];
             for(int j = 0 ; j < c.size();j++)
                 if(occurs[var(c[j])].size() < occurs[var(best)].size())
                     best = c[j];
             const std::vector<CRef> & others = occurs[var(best)];
             for(int j = 0 ; j < others.size();j++){
-                if(!ca[others[j]].mark() && others[j] != learnts[i]){
-                    Lit l = ca[learnts[i]].subsumes_learnt(ca[others[j]]);
+                if(!ca[others[j]].mark() && others[j] != learnts[i] && ca[others[j]].isGoodClause() && !ca[others[j]].canBeDel()){
+                    Lit l = subsumes_faster(ca[learnts[i]], ca[others[j]]);
+                    // ca[learnts[i]].subsumes_learnt(ca[others[j]]);
                     if(l == lit_Error){
                         // Nothing???
                     }
@@ -629,6 +664,9 @@ void Solver::mySubsumptionTest(){
                             if(var(ca[others[j]][k]) != var(l))
                                 newC.push_back(toInt(ca[others[j]][k]));
                         newClauses.push_back(newC);
+                        goodClause.push_back(ca[others[j]].isGoodClause());
+                        if(ca[others[j]].isGoodClause())
+                            goodShrinked++;
                         ca[others[j]].mark(1);
                         /*vec<Lit> newClause;
                         Clause & c2 = ca[others[j]];
@@ -667,8 +705,9 @@ void Solver::mySubsumptionTest(){
 
         learnts.push(cr);
         attachClause(cr);
+        ca[cr].setGood(goodClause[i]);
     }
-    printf("c my subsumption test is done, have %d subsumed clauses and %d which can be shrinked\n", subsumed, couldBeShrinked);
+    printf("c my subsumption test is done, have %d subsumed clauses and %d which can be shrinked (%d good). times was %lf\n", subsumed, couldBeShrinked, goodShrinked, cpuTime() - tStart);
     int i=0;
     int j = 0;
     for (i = j = 0; i < learnts.size(); i++){
@@ -729,7 +768,7 @@ bool Solver::entailed(vec<Lit> & c){
     return ret;
 }
 
-lbool Solver::checkLearnts(){
+lbool Solver::checkLearnts(bool fullCheck){
     assert(0 == decisionLevel());
     int n = learnts.size();
     printf("c check called! \n");
@@ -741,7 +780,7 @@ lbool Solver::checkLearnts(){
         Clause & c = ca[learnts[i]];
 
         bool done = false;
-        if(c.isGoodClause() && !c.wasChecked()){
+        if(c.isGoodClause() && (fullCheck || !c.wasChecked())){
             c.setChecked(true);
             checked++;
             for(int j = 0 ; j < c.size() && !done;j++){
@@ -908,7 +947,7 @@ lbool Solver::search(int nof_conflicts)
                 learnts.push(cr);
                 attachClause(cr);
                 claBumpActivity(ca[cr]);
-                ca[cr].setGood(LBD <= 10);
+                ca[cr].setGood(LBD <= opt_ThresholdPermanent);
 
                 uncheckedEnqueue(learnt_clause[0], cr);
             }
@@ -921,11 +960,15 @@ lbool Solver::search(int nof_conflicts)
                 learntsize_adjust_cnt    = (int)learntsize_adjust_confl;
                 max_learnts             *= learntsize_inc;
 
+
+            }
+            if(conflicts > nextPrintStats){
                 if (verbosity >= 1)
-                    printf("| %9d | %7d %8d %8d | %8d %8d %6.0f | %6.3f %% |\n", 
-                           (int)conflicts, 
-                           (int)dec_vars - (trail_lim.size() == 0 ? trail.size() : trail_lim[0]), nClauses(), (int)clauses_literals, 
+                    printf("| %9d | %7d %8d %8d | %8d %8d %6.0f | %6.3f %% |\n",
+                           (int)conflicts,
+                           (int)dec_vars - (trail_lim.size() == 0 ? trail.size() : trail_lim[0]), nClauses(), (int)clauses_literals,
                            (int)max_learnts, nLearnts(), (double)learnts_literals/nLearnts(), progressEstimate()*100);
+                nextPrintStats += 10000;
             }
 
         }else{
@@ -1207,6 +1250,7 @@ lbool Solver::solve_()
     if (!ok) return l_False;
 
     int delay_Checks = 50000;
+    int delay_counter_asymBranch = 4;
     int conflsNextCheck = delay_Checks;
     solves++;
     if(verbosity >= 1) 
@@ -1225,23 +1269,28 @@ lbool Solver::solve_()
 
     // Search:
     int curr_restarts = 0;
+    int calls = 0;
     while (status == l_Undef){
         double rest_base = luby_restart ? luby(restart_inc, curr_restarts) : pow(restart_inc, curr_restarts);
         status = search(rest_base * restart_first);
         if (!withinBudget()) break;
         curr_restarts++;
-        if(conflicts > conflsNextCheck){
-            lbool test = checkLearnts();
-            conflsNextCheck = conflicts + delay_Checks;
-            if(test == l_False){
-                status = l_False;
+        if(conflicts > conflsNextCheck && status == l_Undef){
+            delay_counter_asymBranch--;
+            if(delay_counter_asymBranch <= 0){
+                lbool test = checkLearnts((calls % 10) == 0);
+                calls++;
+                delay_counter_asymBranch = 4;
+                if(test == l_False){
+                    status = l_False;
+                }
             }
-            else{
-
+            if(status == l_Undef){
                 //checkDuplicates();
                 mySubsumptionTest();
-                //reduceDB();
+                reduceDB();
             }
+            conflsNextCheck = conflicts + delay_Checks;
         }
     }
 

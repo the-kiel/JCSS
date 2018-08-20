@@ -72,10 +72,11 @@ public:
     
     void    asymmbranch  ();
     bool    failedLiteralCheck();
-    lbool   checkLearnts();
+    lbool   checkLearnts(bool full);
     void    checkDuplicates();
 
     void    mySubsumptionTest();
+    Lit     subsumes_faster    (Clause & c1, Clause & c2);
     bool    checkLiteral(Lit p);
     bool    findEquivalences();
     bool    checkAndAdd(vec<Lit>&ps);
@@ -127,6 +128,7 @@ public:
     // Mode of operation:
     //
     int       verbosity;
+    int       nextPrintStats;
     double    var_decay;
     double    clause_decay;
     double    random_var_freq;
