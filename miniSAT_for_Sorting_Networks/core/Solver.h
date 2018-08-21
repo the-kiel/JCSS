@@ -74,8 +74,11 @@ public:
     bool    failedLiteralCheck();
     lbool   checkLearnts(bool full);
     void    checkDuplicates();
-
+    double  dyn_threshold;
+    double  target_rate;
+    void    updateThreshold(bool taken);
     void    mySubsumptionTest();
+    bool    checkSubsumption(Clause & c1, Clause & c2);
     Lit     subsumes_faster    (Clause & c1, Clause & c2);
     bool    checkLiteral(Lit p);
     bool    findEquivalences();
@@ -163,6 +166,7 @@ public:
 
     void     reduceDB         ();                                                      // Reduce the set of learnt clauses.
 
+    unsigned int computeLBD(const Clause &c);
     unsigned int computeLBD(const vec<Lit> &c);
     bool entailed(vec<Lit> & c);
 protected:

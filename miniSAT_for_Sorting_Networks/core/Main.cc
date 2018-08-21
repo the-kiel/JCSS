@@ -55,6 +55,8 @@ static IntOption shrinkGen("MAIN", "shrink", "Shrink generated formula by this n
 static StringOption prefFileName("MAIN", "prefFile", "Name of prefix file");
 static BoolOption opt_create_splitter("MAIN", "splitter", "Create a network which only sorts inputs with n/2 ones", false);
 
+static BoolOption opt_llGuess("MAIN", "llGuess", "Make the guess that the last layer is similar to a half cleaner", false);
+
 
 //=================================================================================================
 
@@ -573,6 +575,7 @@ void createUsedVariables(Solver &s, int n, int d, map<comparator, Var> &compVars
  * */
 
 void createConstraintsForLastSplitLayer(Solver &s, int n, int d, map<comparator, Var> &compVars){
+
     for(int i = 0 ; i < n ; i++){
         for(int j = i+1 ; j < n ; j++){
             assert(compVars.count(comparator(d-1, i, j)));
@@ -583,6 +586,28 @@ void createConstraintsForLastSplitLayer(Solver &s, int n, int d, map<comparator,
         }
     }
     printf("c TODO!!! \n");
+
+    if(opt_llGuess){
+        // Okay, make a wild guess.
+        // we cannot assume the last layer to be a half cleaner, however, maybe it's similar?
+        for(int i = 0 ; 2*i < n ; i++){
+            vec<Lit> ps;
+            int other = n-i-1;
+            if(other -1 >= n/2){// one shorter
+
+                assert(compVars.count(comparator(d-1, i, other-1)));
+                ps.push(mkLit(compVars[comparator(d-1, i, other-1)]));
+            }
+            assert(compVars.count(comparator(d-1, i, other)));
+            ps.push(mkLit(compVars[comparator(d-1, i, other)]));
+            if(other +1 < n){// one shorter
+
+                assert(compVars.count(comparator(d-1, i, other+1)));
+                ps.push(mkLit(compVars[comparator(d-1, i, other+1)]));
+            }
+            s.addClause(ps);
+        }
+    }
 }
 
 /******************************************************************************
