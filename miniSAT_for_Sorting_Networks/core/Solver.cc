@@ -657,10 +657,9 @@ bool Solver::checkSubsumption(Clause & c1, Clause & c2){
     return false;
 }
 
-void Solver::mySubsumptionTest(){
+bool Solver::mySubsumptionTest(){
     double tStart = cpuTime();
-    std::map<int, std::vector<CRef> > occurs;
-    std::map<int, int> nOcc;
+    std::vector<std::vector<CRef> > occurs(nVars()+1);
     for(int i = 0 ; i < learnts.size();i++){
 
         Clause & c = ca[learnts[i]];
@@ -668,9 +667,11 @@ void Solver::mySubsumptionTest(){
         CRef cr = learnts[i];
         for(int j = 0 ; j < c.size();j++){
             occurs[var(c[j])].push_back(cr);
-            nOcc[var(c[j])] ++;
         }
     }
+    for(int i = 0 ; i < occurs.size();i++)
+        std::sort(occurs[i].begin(), occurs[i].end());
+
     sort(learnts, size_lt(ca));
     int subsumed = 0;
     int couldBeShrinked=0;
@@ -681,62 +682,84 @@ void Solver::mySubsumptionTest(){
     for(int i = 0 ; i < n;i++){
         Clause & c = ca[learnts[i]];
         if(!c.mark() && !c.canBeDel() && c.isGoodClause()){
-            Lit best = c[0];
-            for(int j = 0 ; j < c.size();j++)
-                if(occurs[var(c[j])].size() < occurs[var(best)].size())
-                    best = c[j];
-            const std::vector<CRef> & others = occurs[var(best)];
-            for(int j = 0 ; j < others.size();j++){
-                if(!ca[others[j]].mark() && others[j] != learnts[i] && ca[others[j]].isGoodClause() && !ca[others[j]].canBeDel()){
-                    Lit l = subsumes_faster(ca[learnts[i]], ca[others[j]]);
-                    // ca[learnts[i]].subsumes_learnt(ca[others[j]]);
-                    if(l == lit_Error){
-                        // Nothing???
-                    }
-                    else if(l == lit_Undef){
-                        subsumed++;
-                        ca[others[j]].mark(1);
-                    }
-                    else{
-                        checkSubsumption(ca[learnts[i]], ca[others[j]]);
-                        couldBeShrinked++;
-                        std::vector<int> newC;
-                        vec<Lit> testStuff;
-                        for(int k = 0 ; k < ca[others[j]].size();k++)
-                            if(var(ca[others[j]][k]) != var(l)){
-                                newC.push_back(toInt(ca[others[j]][k]));
-                                testStuff.push(ca[others[j]][k]);
-                            }
-                        newClauses.push_back(newC);
-                        if(newC.size() + 1 != ca[others[j]].size()){
-                            printf("c this is weird. size %d -> %d\n", ca[others[j]].size(), newC.size());
-                        }
-                        if(!entailed(testStuff)){
-                            printf("c okay, clause of size %d is not entail just after I found it??? \n", testStuff.size());
-                        }
-                        goodClause.push_back(ca[others[j]].isGoodClause());
-                        if(ca[others[j]].isGoodClause())
-                            goodShrinked++;
-                        ca[others[j]].mark(1);
-                        /*vec<Lit> newClause;
-                        Clause & c2 = ca[others[j]];
-                        for(int k = 0 ; k < c2.size();k++)
-                            if(var(c2[k]) != var(l))
-                                newClause.push(c[k]);
-                        //printf("c c.size() %d c2.size() %d newClause.size() %d \n", c.size(), c2.size(), newClause.size());
-                        assert(c2.size() == newClause.size()+1);
-                        if(newClause.size() > 1){
-                            CRef cr = ca.alloc(newClause, true);
+            Lit best1 = occurs[var(c[0])].size() < occurs[var(c[1])].size() ? c[0] : c[1];
+            Lit best2 = best1 == c[0] ? c[1] : c[0];
+            assert(best1 != best2);
 
-                            learnts.push(cr);
-                            attachClause(cr);
-                            ca[cr].setGood(ca[others[j]].isGoodClause());
-                            ca[others[j]].mark(1);
+            for(int j = 2 ; j < c.size();j++){
+                if(occurs[var(c[j])].size() < occurs[var(best1)].size()){
+                    best2 = best1;
+                    best1 = c[j];
+                }
+                else if(occurs[var(c[j])].size() < occurs[var(best2)].size()){
+                    best2 = c[j];
+                }
+            }
+
+            const std::vector<CRef> & others1 = occurs[var(best1)];
+            const std::vector<CRef> & others2 = occurs[var(best2)];
+            int j1 = 0, j2 = 0;
+            for(j1 = j2 = 0 ; j1 < others1.size() && j2 < others2.size();){
+                if(others1[j1] < others2[j2]){
+                    j1++;
+                }
+                else if(others2[j2] < others1[j1]){
+                    j2++;
+                }
+                else{
+                    if(!ca[others1[j1]].mark() && others1[j1] != learnts[i] && ca[others1[j1]].isGoodClause() && !ca[others1[j1]].canBeDel()){
+                        Lit l = subsumes_faster(ca[learnts[i]], ca[others1[j1]]);
+                        // ca[learnts[i]].subsumes_learnt(ca[others[j]]);
+                        if(l == lit_Error){
+                            // Nothing???
+                        }
+                        else if(l == lit_Undef){
+                            subsumed++;
+                            ca[others1[j1]].mark(1);
                         }
                         else{
-                            printf("c got unit clause by subsumption check??? \n");
-                        }*/
+                            checkSubsumption(ca[learnts[i]], ca[others1[j1]]);
+                            couldBeShrinked++;
+                            std::vector<int> newC;
+                            vec<Lit> testStuff;
+                            for(int k = 0 ; k < ca[others1[j1]].size();k++)
+                                if(var(ca[others1[j1]][k]) != var(l)){
+                                    newC.push_back(toInt(ca[others1[j1]][k]));
+                                    testStuff.push(ca[others1[j1]][k]);
+                                }
+                            newClauses.push_back(newC);
+                            if(newC.size() + 1 != ca[others1[j1]].size()){
+                                printf("c this is weird. size %d -> %d\n", ca[others1[j1]].size(), newC.size());
+                            }
+                            /*if(!entailed(testStuff)){
+                                printf("c okay, clause of size %d is not entail just after I found it??? \n", testStuff.size());
+                            }*/
+                            goodClause.push_back(ca[others1[j1]].isGoodClause());
+                            if(ca[others1[j1]].isGoodClause())
+                                goodShrinked++;
+                            ca[others1[j1]].mark(1);
+                            /*vec<Lit> newClause;
+                            Clause & c2 = ca[others[j]];
+                            for(int k = 0 ; k < c2.size();k++)
+                                if(var(c2[k]) != var(l))
+                                    newClause.push(c[k]);
+                            //printf("c c.size() %d c2.size() %d newClause.size() %d \n", c.size(), c2.size(), newClause.size());
+                            assert(c2.size() == newClause.size()+1);
+                            if(newClause.size() > 1){
+                                CRef cr = ca.alloc(newClause, true);
+
+                                learnts.push(cr);
+                                attachClause(cr);
+                                ca[cr].setGood(ca[others[j]].isGoodClause());
+                                ca[others[j]].mark(1);
+                            }
+                            else{
+                                printf("c got unit clause by subsumption check??? \n");
+                            }*/
+                        }
                     }
+                    j1++;
+                    j2++;
                 }
             }
         }
@@ -750,7 +773,7 @@ void Solver::mySubsumptionTest(){
         if(ps.size() <= 1){
             printf("c okay, found unit clause???\n");
         }
-        bool succ = entailed(ps);
+        bool succ = true; //entailed(ps);
         if(!succ){
             printf("c okay, I got a clause which is not entailed by the formula??? size is %d\n", ps.size());
         }
@@ -776,7 +799,7 @@ void Solver::mySubsumptionTest(){
     learnts.shrink(i - j);
     printf("c after subsumption check DB: %d -> %d clauses\n", i, j);
     checkGarbage();
-
+    return subsumed > 0 || couldBeShrinked > 0;
 }
 
 bool clauseExists(Clause & ps, std::set<std::vector<int> > & seenSoFar){
@@ -830,7 +853,9 @@ lbool Solver::checkLearnts(bool fullCheck){
     int checked = 0;
     int numConfls = 0;
     int numReduced = 0;
-    for(int i = 0 ; i < n ; i++){
+    sort(learnts, size_lt(ca));
+
+    for(int i = 0 ; i < n && checked < 1000 ; i++){
         Clause & c = ca[learnts[i]];
 
         bool done = false;
@@ -1001,7 +1026,7 @@ lbool Solver::search(int nof_conflicts)
                 learnts.push(cr);
                 attachClause(cr);
                 claBumpActivity(ca[cr]);
-                ca[cr].setGood(LBD <= opt_ThresholdPermanent);
+                ca[cr].setGood(LBD <= dyn_threshold);
                 updateThreshold(ca[cr].isGoodClause());
                 uncheckedEnqueue(learnt_clause[0], cr);
             }
@@ -1297,7 +1322,7 @@ bool Solver::failedLiteralCheck(){
 }
 
 void Solver::updateThreshold(bool taken){
-    double c = 10000;
+    double c = 1000;
     double val = taken ? 1 : 0;
     dyn_threshold += (target_rate-val)/c;
 }
@@ -1309,7 +1334,7 @@ lbool Solver::solve_()
     conflict.clear();
     if (!ok) return l_False;
 
-    int delay_Checks = 50000;
+    int delay_Checks = 100000;
     int delay_counter_asymBranch = 4;
     int conflsNextCheck = delay_Checks;
     solves++;
@@ -1354,8 +1379,10 @@ lbool Solver::solve_()
             }
             if(status == l_Undef){
                 //checkDuplicates();
-                mySubsumptionTest();
-                mySubsumptionTest();
+                for(int i = 0 ; i < 5 ; i++)
+                    if(!mySubsumptionTest())
+                        break;
+
                 reduceDB();
             }
             conflsNextCheck = conflicts + delay_Checks;

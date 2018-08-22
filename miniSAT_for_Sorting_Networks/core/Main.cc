@@ -1620,6 +1620,11 @@ int main(int argc, char **argv) {
                 if (opt_prefLayer) {
                     parseSecondlayer(compsReadFromFile, _prefFileName, opt_row);
                 }
+                else if(optfixFirstLayer){
+                    for (int j = 0; j < n - j - 1; j++) {
+                        compsReadFromFile.push_back(comparator(0, j, n - j - 1));
+                    }
+                }
                 int maxLayerReadFromFile = -1;
                 for (vector<comparator>::iterator it = compsReadFromFile.begin(); it != compsReadFromFile.end(); it++) {
                     maxLayerReadFromFile = std::max(maxLayerReadFromFile, it->layer);

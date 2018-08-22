@@ -77,7 +77,7 @@ public:
     double  dyn_threshold;
     double  target_rate;
     void    updateThreshold(bool taken);
-    void    mySubsumptionTest();
+    bool    mySubsumptionTest();
     bool    checkSubsumption(Clause & c1, Clause & c2);
     Lit     subsumes_faster    (Clause & c1, Clause & c2);
     bool    checkLiteral(Lit p);
