@@ -54,6 +54,8 @@ static DoubleOption  opt_garbage_frac      (_cat, "gc-frac",     "The fraction o
 static IntOption     opt_ThresholdPermanent      (_cat, "threshPerm",  "Clauses with LBD at most this value will become permanent", 7, IntRange(0, INT32_MAX));
 static DoubleOption  opt_target_rate       (_cat, "targetRate",        "target rate of how many clauses become permanent", 0.2, DoubleRange(0, true, 1, true));
 
+
+static BoolOption    opt_subsumptionTests       (_cat, "subTests",        "Use subsumption tests on core learnt clauses", false);
 //=================================================================================================
 // Constructor/Destructor:
 
@@ -1366,7 +1368,7 @@ lbool Solver::solve_()
         status = search(maxConfls);
         if (!withinBudget()) break;
         curr_restarts++;
-        if(conflicts > conflsNextCheck && status == l_Undef){
+        if(conflicts > conflsNextCheck && status == l_Undef && opt_subsumptionTests){
             printf("c running tests, dynThreshold=%lf\n", dyn_threshold);
             delay_counter_asymBranch--;
             if(delay_counter_asymBranch <= 0){
@@ -1382,10 +1384,15 @@ lbool Solver::solve_()
                 for(int i = 0 ; i < 5 ; i++)
                     if(!mySubsumptionTest())
                         break;
-
                 reduceDB();
+
             }
+
             conflsNextCheck = conflicts + delay_Checks;
+        }
+        else if(!opt_subsumptionTests && conflicts > conflsNextCheck && status == l_Undef){
+            conflsNextCheck = conflicts + delay_Checks;
+            reduceDB();
         }
     }
 
