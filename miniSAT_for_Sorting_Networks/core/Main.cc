@@ -56,7 +56,11 @@ static StringOption prefFileName("MAIN", "prefFile", "Name of prefix file");
 static BoolOption opt_create_splitter("MAIN", "splitter", "Create a network which only sorts inputs with n/2 ones", false);
 
 static BoolOption opt_llGuess("MAIN", "llGuess", "Make the guess that the last layer is similar to a half cleaner", false);
+static IntOption opt_maxPrefLayer("MAIN", "maxPrefLayer", "Max layer to use from input.\n", 10,
+                           IntRange(0, INT32_MAX));
 
+
+static BoolOption opt_shortComps("MAIN", "shortComps", "Add clauses which enfoce each comparator (i,i+1) to be used", true);
 
 //=================================================================================================
 
@@ -210,6 +214,122 @@ int eval(int val, vector<comparator> &comps) {
 
 
 typedef map<comparator, Var> triVarMap;
+
+void reifyAnd(Solver & s, Lit l, vec<Lit> & rhs){
+    // l -> rhs[i]
+    for(int i = 0 ; i < rhs.size() ; i++){
+        vec<Lit> ps;
+        ps.push(~l);
+        ps.push(rhs[i]);
+        s.addClause(ps);
+    }
+    // ~l -> ~rhs[i]
+    vec<Lit> ps;
+    for(int i = 0 ; i < rhs.size() ; i++){
+        ps.push(~rhs[i]);
+    }
+    ps.push(l);
+    s.addClause(ps);
+}
+
+void printComps(vector<comparator> & comps, int n, int d){
+    for(int i = 0 ; i < d ; i++){
+        printf("\\addtocounter{sncolumncounter}{1}\n");
+        vector<comparator> usedComps;
+        for(int j = 0 ; j < comps.size();j++){
+            if(comps[j].layer == i)
+                usedComps.push_back(comps[j]);
+        }
+
+        // Group these comparators:
+        map<int, vector<comparator> > miniLayers;
+        set<pair<int, int> > usedChannels;
+        for(int j = 0 ; j < usedComps.size();j++){
+
+
+            comparator c = usedComps[j];
+            for(int myLayer = 0 ; myLayer < usedComps.size();myLayer++){
+                bool found = true;
+                for(int k = c.minchan; k <= c.maxchan ; k++){
+                    if(usedChannels.count(make_pair(myLayer, k)))
+                        found = false;
+                }
+                if(found){
+                    for(int k = c.minchan; k <= c.maxchan ; k++){
+                        assert(usedChannels.count(make_pair(myLayer, k)) == 0);
+                        usedChannels.insert(make_pair(myLayer, k));
+                    }
+                    miniLayers[myLayer].push_back(c);
+                    break;
+                }
+            }
+        }
+        for(map<int, vector<comparator> >::iterator it = miniLayers.begin() ; it != miniLayers.end();it++){
+            printf("\\nodeconnection{");
+            vector<comparator> & v = it->second;
+            for(int j = 0 ; j < v.size();j++){
+                printf("{%d,%d}", n-v[j].minchan, n-v[j].maxchan);
+                if(j +1 < v.size())
+                    printf(",");
+            }
+            printf("}\n");
+        }
+        // print them:
+        //printf("\\nodeconnection{ {%d,%d}}\n", n-j, n-k);
+    }
+}
+
+void printNetwork(Solver & netWorkCreate, int n, int d,triVarMap &compVarsInCreatedNW ){
+    vector<comparator> allComps;
+    for(int i = 0 ; i < d ; i++){
+
+
+        for (int j = 0; j < n; j++) {
+            for (int k = j + 1; k < n; k++) {
+                if (netWorkCreate.modelValue(compVarsInCreatedNW[comparator(i, j, k)]) == l_True) {
+                    allComps.push_back(comparator(i,j,k));
+                }
+            }
+        }
+        /*
+        // Group these comparators:
+        map<int, vector<comparator> > miniLayers;
+        set<pair<int, int> > usedChannels;
+        for(int j = 0 ; j < usedComps.size();j++){
+
+
+            comparator c = usedComps[j];
+            for(int myLayer = 0 ; myLayer < usedComps.size();myLayer++){
+                bool found = true;
+                for(int k = c.minchan; k <= c.maxchan ; k++){
+                    if(usedChannels.count(make_pair(myLayer, k)))
+                        found = false;
+                }
+                if(found){
+                    for(int k = c.minchan; k <= c.maxchan ; k++){
+                        assert(usedChannels.count(make_pair(myLayer, k)) == 0);
+                        usedChannels.insert(make_pair(myLayer, k));
+                    }
+                    miniLayers[myLayer].push_back(c);
+                    break;
+                }
+            }
+        }
+        for(map<int, vector<comparator> >::iterator it = miniLayers.begin() ; it != miniLayers.end();it++){
+            printf("\\nodeconnection{");
+            vector<comparator> & v = it->second;
+            for(int j = 0 ; j < v.size();j++){
+                printf("{%d,%d}", n-v[j].minchan, n-v[j].maxchan);
+                if(j +1 < v.size())
+                    printf(",");
+            }
+            printf("}\n");
+        }*/
+        // print them:
+        //printf("\\nodeconnection{ {%d,%d}}\n", n-j, n-k);
+    }
+    printComps(allComps, n, d);
+}
 
 /**********************************************************************
  * a <=> b or c 
@@ -503,28 +623,47 @@ void addAtLeastOneDiffers(Solver &s, vector<Var> &out1, vector<Var> &out2, vecto
 /******************************************************************************
  * Parse our csv-file 
  */
+vector<vector<comparator> > allPrefixes;
 void parseSecondlayer(vector<comparator> &out, const char *fileName, int row) {
     FILE *fp = fopen(fileName, "r");
+    allPrefixes.clear();
+    printf("c parse called! \n");
     int BUF_SIZE = 1024;
     char buffer[BUF_SIZE];
     int rowRead = 0;
     while (fp && !feof(fp)) {
+        vector<comparator> tmp;
         fscanf(fp, "%s", buffer);
-        if (rowRead == row) {
-            char *buff = strtok(buffer, ";");
-            while (buff) {
-                int a, b, c;
-                a = atoi(buff);
-                buff = strtok(NULL, ";");
-                b = atoi(buff);
-                buff = strtok(NULL, ";");
-                c = atoi(buff);
-                buff = strtok(NULL, ";");
-                out.push_back(comparator(a, b, c));
-            }
+        char *buff = strtok(buffer, ";");
+        while (buff) {
+
+            int a, b, c;
+            a = atoi(buff);
+            if(!buff)
+                break;
+            buff = strtok(NULL, ";");
+            if(!buff)
+                break;
+            b = atoi(buff);
+            buff = strtok(NULL, ";");
+            if(!buff)
+                break;
+            c = atoi(buff);
+            buff = strtok(NULL, ";");
+            tmp.push_back(comparator(a, b, c));
         }
-        rowRead++;
+        //printf("c read row %d\n", rowRead++);
+        if(tmp.size() > 0)
+            allPrefixes.push_back(tmp);
     }
+    printf("c Parsed %d prefixes...\n", allPrefixes.size() );
+    out.clear();
+    vector<comparator> & toAdd = allPrefixes[row];
+    for(int i = 0 ; i < toAdd.size();i++){
+        if(toAdd[i].layer < opt_maxPrefLayer)
+            out.push_back(toAdd[i]);
+    }
+    //out.insert(out.end(), allPrefixes[row].begin(), allPrefixes[row].end());
 }
 
 /******************************************************************************
@@ -810,6 +949,125 @@ void psi_3b(Solver &s, int n, int d, map<comparator, Var> &compVars, map<pair<in
         s.addClause(ps);
     }
 }
+vec<Lit> testAssumptions;
+
+void createOnOfThesePrefixes(Solver & s, int n, map<comparator, Var> & compVars, map<pair<int, int>, Var> &used,
+                             vector<comparator> & secondLayer){
+    vector<Var> prefixVars;
+    set<comparator> possComps;
+    int maxLayer = -1;
+    map<comparator, int> noOccurs;
+    for(int i = 0 ; i < allPrefixes.size();i++){
+        // Is this compatible?
+        bool useThis = true;
+        vector<comparator> & thisPrefix = allPrefixes[i];
+        set<pair<int, int> > usedChannels;
+
+        if(thisPrefix.size() < secondLayer.size())
+            useThis = false;
+        //assert(!useThis || thisPrefix.size() >= secondLayer.size());
+        for(int j = 0 ; useThis&& j < secondLayer.size();j++){
+            assert(j < secondLayer.size());
+            assert(j < thisPrefix.size());
+            comparator & c1 = secondLayer[j];
+            comparator & c2 = thisPrefix[j];
+            if(c1.layer != c2.layer || c1.minchan != c2.minchan || c1.maxchan != c2.maxchan){
+                useThis = false;
+                printf("c skipping prefix %d: l1 %d l2 %d c1.min %d c2.min %d c1.max %d c2.max %d\n",
+                       i, c1.layer, c2.layer, c1.minchan, c2.minchan, c1.maxchan, c2.maxchan);
+            }
+
+        }
+        if(useThis){
+            printf("c using prefix %d\n", i);
+            Var v = s.newVar();
+            vec<Lit> comps;
+            for(int j = 0 ; j < thisPrefix.size();j++){
+                comparator & c = thisPrefix[j];
+                if(c.layer > maxLayer)
+                    maxLayer = c.layer;
+                usedChannels.insert(make_pair(c.layer, c.minchan));
+                usedChannels.insert(make_pair(c.layer, c.maxchan));
+                assert(compVars.count(thisPrefix[j]));
+                comps.push(mkLit(compVars[thisPrefix[j]]));
+                possComps.insert(c);
+            }
+            for(int j = 0 ; j < maxLayer ; j++)
+                for(int k = 0 ; k < n ; k++)
+                    if(usedChannels.count(make_pair(j,k)) == 0){
+                        assert(used.count(make_pair(j,k)));
+                        comps.push(~mkLit(used[make_pair(j,k)]));
+                    }
+            printf("c and reifying the and\n");
+            reifyAnd(s, mkLit(v), comps);
+            prefixVars.push_back(v);
+        }
+    }
+    for(int i = 0 ; i < allPrefixes.size();i++){
+        vector<comparator> & thisPrefix = allPrefixes[i];
+        for(int j = 0 ; j < thisPrefix.size();j++){
+            comparator & c = thisPrefix[j];
+            if(c.layer == maxLayer)
+                noOccurs[c]++;
+        }
+    }
+
+    // now one of these vars must hold:
+    printf("c TODO: CHANGE ME: Naive AMO-Encoding! \n");
+    vec<Lit> ps;
+    for(int i = 0 ; i < prefixVars.size();i++){
+        ps.push(mkLit(prefixVars[i]));
+        testAssumptions.push(~mkLit(prefixVars[i]));
+    }
+    s.addClause(ps);
+    for(int i = 0 ; i < prefixVars.size();i++){
+        for(int j = i+1 ; j < prefixVars.size();j++)
+            s.addClause(~mkLit(prefixVars[i]), ~mkLit(prefixVars[j]));
+    }
+    int maxOcc = 0;
+    for(map<comparator, int>::iterator it = noOccurs.begin() ; it != noOccurs.end();it++){
+        if(it->second > 3){
+            const comparator & c = it->first;
+            printf("c comp %d -> %d occurs %d times\n", c.minchan, c.maxchan, it->second);
+            int nbBefore = s.nFreeVars();
+            if(it->second == allPrefixes.size()){
+                s.checkLiteral(~mkLit(compVars[c]));
+            }
+            if(s.nFreeVars() != nbBefore){
+                printf("c fixed this variable! \n");
+            }
+            if(it->second > maxOcc && it->second < allPrefixes.size()){
+                maxOcc = it->second;
+                testAssumptions.clear();
+                testAssumptions.push(~mkLit(compVars[c]));
+                printf("c pushing assumption NOT %d -> %d\n", c.minchan, c.maxchan);
+            }
+        }
+    }
+    /*printf("c testing comps: \n");
+    int oldVer = s.verbosity;
+    s.verbosity = 0;
+    for(int i = 0 ; i < n ; i++){
+        for(int j = i+1 ; j < n ; j++){
+            comparator c(maxLayer, i, j);
+            assert(compVars.count(c));
+            if(!possComps.count(c)){
+                Var v = compVars[c];
+                printf("c verifiying that comp %d -> %d cannot be used! \n", i, j);
+                vec<Lit> ps;
+                ps.push(mkLit(v));
+                int conflBefore = s.conflicts;
+                lbool ret = s.solveLimited(ps);
+                printf("c solver returned false? %d\n", ret == l_False);
+                printf("c conlfs required: %d\n", s.conflicts - conflBefore);
+            }
+        }
+    }
+    s.verbosity = oldVer;
+*/
+
+}
+
 
 /******************************************************************************
  * Create a formula for a feasible comparator network. 
@@ -842,8 +1100,10 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
 
     once(s, n, d, compVars);
     createUsedVariables(s, n, d, compVars, used);
-    if(!createSplitModule)
-        createConstraintsForLength1Comparators(s, n, d, compVars);
+    if(!createSplitModule){
+        if(opt_shortComps)
+            createConstraintsForLength1Comparators(s, n, d, compVars);
+    }
     else{
         createConstraintsForLastSplitLayer(s, n, d, compVars);
     }
@@ -859,6 +1119,8 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
         printf("Reading input from %s\n", _prefFileName);
         vector<comparator> secondlayer;
         parseSecondlayer(secondlayer, _prefFileName, opt_row);
+        printf("c prefix: \n");
+        printComps(secondlayer, n, d);
         // if nothing was read, try "Parberry" first layer
         if (secondlayer.size() == 0) {
             for (int i = 0; i < n; i += 2) {
@@ -895,6 +1157,7 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
                 }
             }
         }
+        //createOnOfThesePrefixes(s, n, compVars, used, secondlayer);
     } else if (fixFirst) {
 
         printf("Adding BZ-style first vector...\n");
@@ -1279,26 +1542,47 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
 
     printf("Creating inputs, read %d comparators from file\n", compsReadFromFile.size());
     // Small change: Get ALL possible outputs of the prefix here
+    bool useAllPrefixes = false;
+    set<int> inputsSeen;
+    int multiples = 0;
     for (int i = 0; i < (1 << n); i++) {
         if(! opt_create_splitter || getNumOnes(i, n) == n/2){
 
-            int unsorted = getNumUnsorted(i, n);
+            if(useAllPrefixes){
+                for(int j = 0 ; j < allPrefixes.size();j++){
+                    int tmpStuff = eval(i, allPrefixes[j]);
+                    if (inputsToAdd.find(tmpStuff) == inputsToAdd.end()) {
+                        if(inputsSeen.count(i)){
+                            //printf("c adding input %d, it was added before! \n", i);
+                            multiples++;
+                        }
+                        else{
+                            inputsToAdd[tmpStuff] = i;
+                            inputsSeen.insert(i);
+                        }
+                    }
+                }
+            }
+            else{
+                int unsorted = getNumUnsorted(i, n);
 
-            int tmpStuff = compsReadFromFile.size() == 0 ? evalParberry(i, n) : eval(i, compsReadFromFile);
-            // getRating : num of leading zeros + num of tailing ones
+                int tmpStuff = compsReadFromFile.size() == 0 ? evalParberry(i, n) : eval(i, compsReadFromFile);
+                // getRating : num of leading zeros + num of tailing ones
 
 
-            if (inputsToAdd.find(tmpStuff) == inputsToAdd.end()) {
-                inputsToAdd[tmpStuff] = i;
-            } else {
-                // Already found this vector AFTER the first two layers. What does the input for this look like?
-                if (getRating(i, n) > getRating(inputsToAdd[tmpStuff], n)) {
+                if (inputsToAdd.find(tmpStuff) == inputsToAdd.end()) {
                     inputsToAdd[tmpStuff] = i;
+                } else {
+                    // Already found this vector AFTER the first two layers. What does the input for this look like?
+                    if (getRating(i, n) > getRating(inputsToAdd[tmpStuff], n)) {
+                        inputsToAdd[tmpStuff] = i;
+                    }
                 }
             }
         }
 
     }
+
     vector<testInput> possibleInputs;
     for (map<int, int>::iterator it = inputsToAdd.begin(); it != inputsToAdd.end(); it++) {
         int _out = it->first;
@@ -1381,6 +1665,9 @@ bool findFeasibleNetwork(Solver &s, int iteration) {
     if(!s.okay())
         return false;
     vec<Lit> emptyAssumptions;
+    for(int i = 0 ; i < testAssumptions.size() ; i++)
+        emptyAssumptions.push(testAssumptions[i]);
+
     return findFeasibleNetwork(s, iteration, emptyAssumptions);
 }
 
@@ -1717,7 +2004,7 @@ int main(int argc, char **argv) {
 
                 /* Give a (ugly) latex-version of the network found*/
                 // plot lines: 
-                for (int i = 0; i < n; i++) {
+                /*for (int i = 0; i < n; i++) {
                     printf("\\draw[color=black] (%d,%d)--(%d,%d);\n", 0, i, d, i);
                 }
                 for (int i = 0; i < d; i++) {
@@ -1732,8 +2019,9 @@ int main(int argc, char **argv) {
                         }
                     }
                     printf("\n");
-                }
+                }*/
                 netWorkCreate.toDimacs("formula.cnf");
+                printNetwork(netWorkCreate, n, d, compVarsInCreatedNW);
             }
         }
         printf("time was %f s\n", cpuTime() - initial_time);

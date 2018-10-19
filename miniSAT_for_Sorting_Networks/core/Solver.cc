@@ -54,6 +54,8 @@ static DoubleOption  opt_garbage_frac      (_cat, "gc-frac",     "The fraction o
 static IntOption     opt_ThresholdPermanent      (_cat, "threshPerm",  "Clauses with LBD at most this value will become permanent", 7, IntRange(0, INT32_MAX));
 static DoubleOption  opt_target_rate       (_cat, "targetRate",        "target rate of how many clauses become permanent", 0.2, DoubleRange(0, true, 1, true));
 
+static IntOption     opt_restartInterval     (_cat, "restarts",      "Number of conflicts between restarts", 1024, IntRange(0, INT32_MAX));
+
 
 static BoolOption    opt_subsumptionTests       (_cat, "subTests",        "Use subsumption tests on core learnt clauses", false);
 //=================================================================================================
@@ -1006,6 +1008,8 @@ lbool Solver::search(int nof_conflicts)
     int         conflictC = 0;
     vec<Lit>    learnt_clause;
     starts++;
+    bool dynRestarts = false;
+    int deepestBT = 1<<24;
     for (;;){
         CRef confl = propagate();
 
@@ -1020,7 +1024,14 @@ lbool Solver::search(int nof_conflicts)
 
             unsigned int LBD = computeLBD(learnt_clause);
             cancelUntil(backtrack_level);
-            
+            if(backtrack_level < deepestBT){
+
+                deepestBT = backtrack_level;
+                if(dynRestarts && conflictC > 100){
+                    printf("c bt to %d, increasing number of conflicts remaining! \n", backtrack_level);
+                    nof_conflicts += 1024;
+                }
+            }
             if (learnt_clause.size() == 1){
                 uncheckedEnqueue(learnt_clause[0]);
             }else{
@@ -1365,7 +1376,7 @@ lbool Solver::solve_()
         if(maxConfls > 4000){
             maxConfls = 4000;
         }
-        status = search(maxConfls);
+        status = search(opt_restartInterval);
         if (!withinBudget()) break;
         curr_restarts++;
         if(conflicts > conflsNextCheck && status == l_Undef && opt_subsumptionTests){
