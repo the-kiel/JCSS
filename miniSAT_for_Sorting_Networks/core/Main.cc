@@ -105,7 +105,7 @@ static void SIGINT_exit(int signum) {
     _exit(1);
 }
 
-
+vec<Lit> firstCubes;
 /**********************************************************************
 * The comparator class
 */
@@ -1276,6 +1276,9 @@ void addInputImprovedEncoding(Solver &s, vector<bool> &newInput, int n, int d, t
             tailingOnes++;
         }
     }
+    /*if(zeros == 9){
+        printf("c input %d zeros %d ones %d leading %d trailing\n", zeros, n-zeros, leadingZeros, tailingOnes);
+    }*/
     // Create new internal variables
     for (int i = 0; i < d - 1; i++) {
         for (int j = 0; j < n; j++) {
@@ -1646,6 +1649,7 @@ bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
     bool netWorkCreated = false;
     while (!done) {
         s.budgetForRandom = 0;
+        lbool test = s.DFS_Solve(firstCubes);
         bool solved = s.solve(allAssumptions);
         if (solved) {
             done = true;
@@ -1758,6 +1762,196 @@ bool findCounterExample(Solver &testSolver, Solver &creationSolver, map<comparat
     return findMinSizeCounterExample(testSolver, assumptions, inputVars, newInput, n, innerVars);
 
 }
+
+int addSuffixInput(Solver & s, int n, int d,triVarMap &compVarsInCreatedNW,
+                   map<pair<int, int>, Var> &used, Var &T, Var &F, triVarMap &intVars,
+                   triVarMap &rangeVars, vector<bool> & newInput, int suffDepth){
+    vector<bool> newOutput;
+    map<pair<int, int>, Var> newInternalVars;
+    Var mkConditional = s.newVar();
+    int zeros = 0;
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        if (!newInput[i]) {
+            zeros++;
+        }
+    }
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        newOutput.push_back(i < zeros ? false : true);
+    }
+    int leadingZeros = 0;
+    for (unsigned i = 0; i < newInput.size(); i++) {
+        if (newInput[i])
+            break;
+        else
+            leadingZeros++;
+    }
+    int tailingOnes = 0;
+    for (unsigned i = newInput.size() - 1; i >= 0; i--) {
+        if (!newInput[i])
+            break;
+        else {
+            tailingOnes++;
+        }
+    }
+    printf("c have %d leading zeros, and %d trailing ones! \n", leadingZeros, tailingOnes);
+    //assert(leadingZeros >= 6);
+    //assert(tailingOnes >= 6);
+
+    // Create new internal variables
+    for (int i = d-suffDepth; i < d - 1; i++) {
+        for (int j = 0; j < n; j++) {
+            if (j < leadingZeros) {
+                newInternalVars[make_pair(i, j)] = F;
+            } else if (j >= n - tailingOnes) {
+                newInternalVars[make_pair(i, j)] = T;
+            } else {
+                Var v = s.newVar();
+                newInternalVars[make_pair(i, j)] = v;
+            }
+        }
+    }
+    // Add input- and output-variables:
+    for (int j = 0; j < n; j++) {
+        newInternalVars[make_pair(d-suffDepth-1, j)] = newInput[j] ? T : F;
+        assert(newInternalVars.count(make_pair(d - 1, j)) == 0);
+        Var newOut = s.newVar();
+        newInternalVars[make_pair(d - 1, j)] = newOut;
+        // If this input is used, the it must be sorted!
+        if(newOutput[j]){
+           s.addClause(~mkLit(mkConditional), mkLit(newOut));
+        }
+        else{
+            s.addClause(~mkLit(mkConditional), ~mkLit(newOut));
+        }
+         //= newOutput[j] ? T : F;
+    }
+    // Add update-rules:
+
+    for (int i = d-suffDepth; i < d; i++) {
+        for (int j = leadingZeros; j < (n - tailingOnes); j++) {
+            // Let us assume that the value on this channel is "1".
+            // Thus, this will stay unless there is a comparator down inside the window,
+            // and the other input is "0".
+            vec<Lit> ps;
+            // If none of the comparators to higher indices is used...
+            if (rangeVars.count(comparator(i, j, n - tailingOnes - 1)) == 0) {
+                addOneFromToRange(s, i, j, n - tailingOnes - 1, compVarsInCreatedNW, rangeVars);
+            }
+            ps.push(mkLit(rangeVars[comparator(i, j, n - tailingOnes - 1)]));
+            // And the input is "1"
+            ps.push(~mkLit(newInternalVars[make_pair(i - 1, j)]));
+            // Then, the output is "1"
+            ps.push(mkLit(newInternalVars[make_pair(i, j)]));
+            s.addClause(ps);
+            ps.clear();
+
+            // Not let us assume there is a comparator to a higher index.
+            // This, this "1" will disappear if the other input is a "0"
+            for (int k = j + 1; k < n - tailingOnes; k++) {
+                // If the other input is "0"...
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, j, k)]));
+                ps.push(mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+                // If both inputs equal "1"
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, j, k)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i - 1, j)]));
+                ps.push(mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+            }
+            // What if the input is "0"?
+            // No comparator to lower indices -> output will be zero
+            if (rangeVars.count(comparator(i, j, leadingZeros)) == 0) {
+                addOneFromToRange(s, i, j, leadingZeros, compVarsInCreatedNW, rangeVars);
+            }
+            ps.push(mkLit(rangeVars[comparator(i, j, leadingZeros)]));
+
+            ps.push(mkLit(newInternalVars[make_pair(i - 1, j)]));
+            ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
+            s.addClause(ps);
+            ps.clear();
+            for (int k = leadingZeros; k < j; k++) {
+                // Comparator chosen, and other value="1" -> swap
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, k, j)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+
+                // Comparator chosen, and other value="0" -> still "0"
+                ps.push(~mkLit(compVarsInCreatedNW[comparator(i, k, j)]));
+                ps.push(mkLit(newInternalVars[make_pair(i - 1, k)]));
+                ps.push(mkLit(newInternalVars[make_pair(i - 1, j)]));
+                ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
+                s.addClause(ps);
+                ps.clear();
+            }
+        }
+    }
+    return toInt(mkLit(mkConditional));
+}
+
+void testTheseVars(Solver & s, int index, vector<int> & testVars, int numConfls, vec<Lit> & ass){
+
+    if(index < testVars.size()){
+        ass.push(toLit(testVars[index]));
+        s.setConfBudget(numConfls);
+        lbool ret = s.solveLimited(ass);
+        if(ret == l_True){
+            printf("c this combination of %d cases works...\n", ass.size());
+            testTheseVars(s, index+1, testVars, numConfls, ass);
+            ass.pop();
+            testTheseVars(s, index+1, testVars, numConfls, ass);
+        }
+        else if (ret == l_False){
+            printf("c conflict, %d cases used! \n", ass.size());
+            ass.pop();
+            testTheseVars(s, index+1, testVars, numConfls, ass);
+        }
+        else{
+            printf("c INDET, recursive call! \n");
+            testTheseVars(s, index+1, testVars, numConfls, ass);
+            ass.pop();
+        }
+
+    }
+}
+
+int countNumOnes(int v){
+    int ret = 0;
+    for(int i = 0 ; i < 24 ; i++)
+        if(v & (1<<i))
+            ret++;
+    return ret;
+}
+
+void testLastLayerStuff(Solver & s, int n, int d,triVarMap &compVarsInCreatedNW,
+                        map<pair<int, int>, Var> &used, Var &T, Var &F, triVarMap &intVars,
+                        triVarMap &rangeVars){
+    assert(n == 18);
+    vector<int> testVariables;
+    int maskLower = 0x3F;
+    int maskUpper = (0x3F)<<12;
+    for(int i = 0 ; i < (1<<n) ; i++){
+        if(countNumOnes(i) == n/2){
+            vector<bool> newInput;
+            int tmp = i;
+            if (((i & maskLower) == 0) && ((i & maskUpper) == maskUpper)){
+                for(int j = 0 ; j < n ; j++)
+                    newInput.push_back(i & (1<<j));
+                testVariables.push_back(addSuffixInput(s, n, d, compVarsInCreatedNW, used, T, F, intVars, rangeVars, newInput, 2));
+            }
+        }
+
+    }
+    printf("c got %d testVariable! \n", testVariables.size());
+    vec<Lit> ass;
+    testTheseVars(s, 0, testVariables, 1000, ass);
+}
+
 //=================================================================================================
 // Main:
 
@@ -1891,6 +2085,9 @@ int main(int argc, char **argv) {
         createNetWorkFormula(netWorkCreate, n, d, compVarsInCreatedNW, used, T, F, opt_create_splitter);
         netWorkCreate.verbosity = verb;
         vector<comparator> compsReadFromFile;
+        if(n == 18){
+            //testLastLayerStuff(netWorkCreate, n, d, compVarsInCreatedNW, used, T, F, internalVarsInCreatedNW, rangeVars);
+        }
         /*******************************************************
          * Add all inputs that are not equivalent modulo the first layers. 
          */
@@ -1932,7 +2129,14 @@ int main(int argc, char **argv) {
                 printf("Internal vars: %d and %d\n", compVarsInCreatedNW.size(), compVarsInTestNW.size());
                 printf("looking for a feasible network: \n");
                 double t_ = cpuTime();
+                netWorkCreate.toDimacs("bla.cnf");
+                if(n == 18 && d == 10){
+                    if(compVarsInCreatedNW.count(comparator(8, 8, 11))){
+                        firstCubes.push(mkLit(compVarsInCreatedNW[comparator(8, 8, 11)]));
+                        firstCubes.push(mkLit(compVarsInCreatedNW[comparator(8, 10, 13)]));
+                    }
 
+                }
                 bool newNetWorkCreated = findFeasibleNetwork(netWorkCreate, iterations);
 
                 printf("Network Creation took %lf s\n", cpuTime() - t_);

@@ -164,11 +164,19 @@ public:
     
     void  lookahead(Var & v, bool & pol, int & numProps);
 
+    void    reduceDB_with_assumptions(vec<Lit> & ass);
     void     reduceDB         ();                                                      // Reduce the set of learnt clauses.
 
     unsigned int computeLBD(const Clause &c);
     unsigned int computeLBD(const vec<Lit> &c);
     bool entailed(vec<Lit> & c);
+    lbool   DFS_Solve(vec<Lit> & firstCubes);
+    Lit     getNextBranchLit(vec<Lit> & ass);
+    bool FL_Check_fast();
+    bool checkLitFast(Lit l, std::vector<bool> & seenHere);
+    bool    restoreTrail(vec<Lit> & ass);
+    void updateProgress(int length, std::vector<int> & progress);
+    void checkClausesUnterAssumptions(vec<Lit> & ass, std::set<std::vector<int> > & allClauses, std::set<std::pair<int, int> > & binaries, int & duplicates);
 protected:
 
     // Helper structures:
@@ -258,7 +266,8 @@ protected:
     bool     litRedundant     (Lit p, uint32_t abstract_levels);                       // (helper method for 'analyze()')
     lbool    search           (int nof_conflicts);                                     // Search for a given number of conflicts.
     lbool    solve_           ();                                                      // Main solve method (assumptions given in 'assumptions').
-    
+
+
     void     removeSatisfied  (vec<CRef>& cs);                                         // Shrink 'cs' to contain only non-satisfied clauses.
     void     rebuildOrderHeap ();
 
@@ -333,12 +342,12 @@ inline void Solver::claBumpActivity (Clause& c) {
         if ( (c.activity() += cla_inc) > 1e20 ) {
             // Rescale:
             bool written = false;
-            //printf("Rescaling clause activities\n");
+            printf("Rescaling clause activities\n");
             for (int i = 0; i < learnts.size(); i++){
                 ca[learnts[i]].activity() *= 1e-20;
                 if(ca[learnts[i]].activity() == 0.0 && !written){
-                    //printf("Act dropped to 0.0\n");
-                    //written = true;
+                    printf("Act dropped to 0.0\n");
+                    written = true;
                 }
             }
             cla_inc *= 1e-20; } }

@@ -29,6 +29,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include <algorithm>
 
 #include <ctime>
+#include <cmath>
 using namespace Minisat;
 using namespace std;
 //=================================================================================================
@@ -595,7 +596,7 @@ void Solver::reduceDB()
             removeClause(learnts[i]);
         else{
             learnts[j++] = learnts[i];
-            if(!c.isGoodClause()){
+            if(!c.isGoodClause() || assumptions.size() > 0){
                 c.setCanBeDel(true);
             }
         }
@@ -1184,6 +1185,51 @@ bool Solver::checkLiteral(Lit p){
     return true;
 }
 
+bool Solver::checkLitFast(Lit l, vector<bool> & seenHere){
+    if(value(l) != l_Undef)
+        return false;
+    if(seenHere[toInt(l)])
+        return false;
+    newDecisionLevel();
+    uncheckedEnqueue(l);
+    CRef confl = propagate();
+
+    if(confl == CRef_Undef){
+        for(int i = trail.size()-1 ; i > 0 ; i--){
+            seenHere[toInt(trail[i])]=true;
+            if(level(var(trail[i])) == 0)
+                break;
+        }
+        cancelUntil(0);
+        return false;
+    }
+    else{
+        uncheckedEnqueue(~l);
+        confl = propagate();
+        if(confl != CRef_Undef){
+            ok = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Solver::FL_Check_fast(){
+    cancelUntil(0);
+    vector<bool> seenHere(2*nVars(), false);
+    int nBefore = trail.size();
+    for(int i = 0 ; i < nVars();i++){
+        assert(0 == decisionLevel());
+        if(checkLitFast(mkLit(i), seenHere))
+            return false;
+        assert(0 == decisionLevel());
+        if(checkLitFast(~mkLit(i), seenHere))
+            return false;
+        assert(0 == decisionLevel());
+    }
+    return trail.size() != nBefore;
+}
+
 bool Solver::failedLiteralCheck(){
     assert(decisionLevel()==0);
     int nbSetBefore=trail.size();
@@ -1340,6 +1386,250 @@ void Solver::updateThreshold(bool taken){
     dyn_threshold += (target_rate-val)/c;
 }
 
+void Solver::checkClausesUnterAssumptions(vec<Lit> & ass, set<vector<int> > & allClauses, set<pair<int, int> > & binaries, int & duplicates){
+    if(!restoreTrail(ass))
+        return;
+    int equivs = 0;
+    int implied = 0;
+    for(int i = 0 ; i < clauses.size();i++){
+        Clause & c = ca[clauses[i]];
+        int nTrue = 0;
+        int nFalse = 0;
+        vector<int> v;
+        for(int j = 0 ; j < c.size();j++){
+            if(value(c[j]) == l_True)
+                nTrue++;
+            else if(value(c[j]) == l_Undef)
+                v.push_back(toInt(c[j]));
+        }
+        if(nTrue == 0){
+            sort(v.begin(), v.end());
+            if(allClauses.count(v))
+                duplicates++;
+            else
+                allClauses.insert(v);
+            if(v.size() == 2){
+                binaries.insert(make_pair(v[0], v[1]));
+                if(binaries.count(make_pair(v[0]^1, v[1]^1)))
+                    equivs++;
+                else if(binaries.count(make_pair(v[0]^1, v[1])) || binaries.count(make_pair(v[0], v[1]^1)))
+                    implied++;
+            }
+        }
+    }
+    for(int i = 0 ; i < learnts.size();i++){
+        Clause & c = ca[learnts[i]];
+        int nTrue = 0;
+        int nFalse = 0;
+        vector<int> v;
+        for(int j = 0 ; j < c.size();j++){
+            if(value(c[j]) == l_True)
+                nTrue++;
+            else if(value(c[j]) == l_Undef)
+                v.push_back(toInt(c[j]));
+        }
+        if(nTrue == 0){
+            sort(v.begin(), v.end());
+            if(allClauses.count(v))
+                duplicates++;
+            else
+                allClauses.insert(v);
+            if(v.size() == 2){
+                binaries.insert(make_pair(v[0], v[1]));
+                if(binaries.count(make_pair(v[0]^1, v[1]^1)))
+                    equivs++;
+                else if(binaries.count(make_pair(v[0]^1, v[1])) || binaries.count(make_pair(v[0], v[1]^1)))
+                    implied++;
+            }
+        }
+    }
+    printf("c checked clauses, have %d actual clauses left, %d duplicates, %d equivalences, %d implied literals! \n", allClauses.size(), duplicates, equivs, implied);
+    cancelUntil(0);
+}
+
+Lit    Solver::getNextBranchLit(vec<Lit> & ass)
+{
+    cancelUntil(0);
+    for(int i = 0 ; i < ass.size();i++){
+        if(value(ass[i]) == l_Undef){
+            newDecisionLevel();
+            uncheckedEnqueue(ass[i]);
+            CRef confl = propagate();
+            if(confl != CRef_Undef){
+                printf("c got conflict while getting new cube! \n");
+                cancelUntil(0);
+                return lit_Undef;
+            }
+        }
+        else if(value(ass[i]) == l_False){
+            printf("c looking for cube, lit is false??? \n");
+            cancelUntil(0);
+            return lit_Undef;
+        }
+    }
+    Lit next = pickBranchLit();
+    cancelUntil(0);
+    return next;
+}
+bool    Solver::restoreTrail(vec<Lit> & ass){
+    cancelUntil(0);
+    for(int i = 0 ; i < ass.size();i++){
+        if(value(ass[i]) == l_Undef){
+            newDecisionLevel();
+            uncheckedEnqueue(ass[i]);
+            CRef confl = propagate();
+            if(confl != CRef_Undef){
+                printf("c got conflict while restoring trail! \n");
+                cancelUntil(0);
+                return false;
+            }
+        }
+        else if(value(ass[i]) == l_False){
+            cancelUntil(0);
+            return false;
+        }
+    }
+    return true;
+}
+
+void Solver::updateProgress(int length, vector<int> & progress){
+    while(progress.size() <= length)
+        progress.push_back(0);
+    while(length >= 0){
+        if(progress[length])
+            progress[length]=0;
+        else{
+            progress[length]=1;
+            break;
+        }
+    }
+    double sum = 0.0;
+    for(int i = 0 ; i < progress.size();i++){
+        if(progress[i])
+            sum += std::pow(0.5, i);
+    }
+    printf("c progress: %lf\n", sum);
+}
+
+lbool Solver::DFS_Solve(vec<Lit> & firstCubes){
+    vector<vector<int> > cubes;
+    vector<int> progress;
+    if(firstCubes.size() > 0){
+        for(int i = 0 ; i < (1<<firstCubes.size()) ; i++){
+            vector<int> v;
+            for(int j = 0 ; j < firstCubes.size();j++){
+                if(i & (1<<j))
+                    v.push_back(toInt(firstCubes[j]));
+                else
+                    v.push_back(toInt(~firstCubes[j]));
+
+            }
+            cubes.push_back(v);
+        }
+
+    }
+    else
+        cubes.push_back(vector<int>());
+    bool done = false;
+    verbosity = 0;
+    int numChecked = 0;
+    while(!done){
+        int bestIndex = cubes.size()-1;
+        if(false && numChecked < 128){
+            // take shortest cube
+            for(int i = 0 ; i < cubes.size();i++){
+                if(cubes[i].size() < cubes[bestIndex].size())
+                    bestIndex = i;
+            }
+        }
+        else{
+            // take last cube
+        }
+        vector<int> v = cubes[bestIndex];
+        cubes.erase(cubes.begin()+bestIndex);
+        printf("c checking cube ");
+        for(int i = 0 ; i < v.size();i++){
+               printf("%d ", (v[i] % 2 == 0) ? v[i]/2 : -v[i]/2);
+        }
+        printf("\n");
+        set<vector<int> > tmpSet;
+        set<pair<int, int> > tmpBinaries;
+        int numDupl=0;
+        numChecked++;
+        vec<Lit> ass;
+        for(int i = 0 ; i < v.size();i++)
+            ass.push(toLit(v[i]));
+        setConfBudget(numChecked < 128 ? 10 * 1000 : 50 * 1000);
+        checkClausesUnterAssumptions(ass, tmpSet, tmpBinaries, numDupl);
+        lbool ret = solveLimited(ass);
+        if(ret == l_True)
+            return l_True;
+        else if(ret == l_False){
+            printf("c cube of size %d is UNSAT! ", ass.size());
+            for(int i = 0 ; i < v.size();i++){
+                printf("%d ", (v[i] % 2 == 0) ? v[i]/2 : -v[i]/2);
+            }
+            printf("\n");
+            printf("c conflict size %d\n", conflict.size());
+            if(conflict.size() == 0)
+                done = true;
+            updateProgress(ass.size(), progress);
+            addClause(conflict);
+        }
+        else{
+            Lit next = getNextBranchLit(ass);
+            if(next == lit_Undef)
+                cubes.push_back(v);
+            else{
+                vector<int> v2(v.begin(), v.end());
+                vector<int> v3(v.begin(), v.end());
+                v2.push_back(toInt(~mkLit(var(next))));
+                v3.push_back(toInt(mkLit(var(next))));
+                cubes.push_back(v2);
+                cubes.push_back(v3);
+            }
+        }
+    }
+    return l_False;
+}
+
+void Solver::reduceDB_with_assumptions(vec<Lit> & ass){
+    cancelUntil(0);
+    int nbLockedBefore = 0;
+    for(int i = 0 ; i < learnts.size();i++){
+        Clause & c = ca[learnts[i]];
+        if(locked(c))
+            nbLockedBefore++;
+    }
+    for(int i = 0 ; i < ass.size();i++){
+        if(value(ass[i]) == l_Undef){
+            newDecisionLevel();
+            uncheckedEnqueue(ass[i]);
+            CRef confl = propagate();
+            if(confl != CRef_Undef){
+                printf("c got conflict while trying to clean DB! \n");
+                cancelUntil(0);
+                return;
+            }
+        }
+        else if(value(ass[i]) == l_False){
+            printf("c got conflict while trying to clean DB, lit is false??? \n");
+            cancelUntil(0);
+            return;
+        }
+    }
+    int nbLockedAfter = 0;
+    for(int i = 0 ; i < learnts.size();i++){
+        Clause & c = ca[learnts[i]];
+        if(locked(c))
+            nbLockedAfter++;
+    }
+    printf("c reduce with assumptions, locked: %d vs %d\n", nbLockedBefore, nbLockedAfter);
+    reduceDB();
+    cancelUntil(0);
+    return;
+}
+
 // NOTE: assumptions passed in member-variable 'assumptions'.
 lbool Solver::solve_()
 {
@@ -1347,7 +1637,7 @@ lbool Solver::solve_()
     conflict.clear();
     if (!ok) return l_False;
 
-    int delay_Checks = 100000;
+    int delay_Checks = 10000;
     int delay_counter_asymBranch = 4;
     int conflsNextCheck = delay_Checks;
     solves++;
@@ -1368,6 +1658,9 @@ lbool Solver::solve_()
     dyn_threshold = opt_ThresholdPermanent;
     target_rate = opt_target_rate;
     // Search:
+    if(assumptions.size() > 0){
+        reduceDB_with_assumptions(assumptions);
+    }
     int curr_restarts = 0;
     int calls = 0;
     while (status == l_Undef){
@@ -1400,9 +1693,11 @@ lbool Solver::solve_()
             }
 
             conflsNextCheck = conflicts + delay_Checks;
+            delay_Checks *= 1.3;
         }
-        else if(!opt_subsumptionTests && conflicts > conflsNextCheck && status == l_Undef){
+        else if(!opt_subsumptionTests && conflicts > conflsNextCheck && status == l_Undef && assumptions.size() == 0){
             conflsNextCheck = conflicts + delay_Checks;
+
             reduceDB();
         }
     }
