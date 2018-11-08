@@ -30,6 +30,10 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 
 #include <ctime>
 #include <cmath>
+
+#include <mpi.h>
+
+
 using namespace Minisat;
 using namespace std;
 //=================================================================================================
@@ -39,7 +43,7 @@ using namespace std;
 static const char* _cat = "CORE";
 
 static DoubleOption  opt_var_decay         (_cat, "var-decay",   "The variable activity decay factor",            0.95,     DoubleRange(0, false, 1, false));
-static DoubleOption  opt_clause_decay      (_cat, "cla-decay",   "The clause activity decay factor",              0.999,    DoubleRange(0, false, 1, false));
+static DoubleOption  opt_clause_decay      (_cat, "cla-decay",   "The clause activity decay factor",              0.9999,    DoubleRange(0, false, 1, false));
 static DoubleOption  opt_random_var_freq   (_cat, "rnd-freq",    "The frequency with which the decision heuristic tries to choose a random variable", 0, DoubleRange(0, true, 1, true));
 static DoubleOption  opt_random_seed       (_cat, "rnd-seed",    "Used by the random variable selection",         91648253, DoubleRange(0, false, HUGE_VAL, false));
 static IntOption     opt_ccmin_mode        (_cat, "ccmin-mode",  "Controls conflict clause minimization (0=none, 1=basic, 2=deep)", 2, IntRange(0, 2));
@@ -57,6 +61,8 @@ static DoubleOption  opt_target_rate       (_cat, "targetRate",        "target r
 
 static IntOption     opt_restartInterval     (_cat, "restarts",      "Number of conflicts between restarts", 1024, IntRange(0, INT32_MAX));
 
+static IntOption     opt_numConfls      (_cat, "numConfls",      "Number of conflicts before splitting the cube", 100000, IntRange(1, INT32_MAX));
+static IntOption     opt_maxDB          (_cat, "maxDB",      "Size of learnt clause database before clean", 300000, IntRange(1, INT32_MAX));
 
 static BoolOption    opt_subsumptionTests       (_cat, "subTests",        "Use subsumption tests on core learnt clauses", false);
 //=================================================================================================
@@ -587,12 +593,16 @@ void Solver::reduceDB()
     int     i, j;
     double  extra_lim = cla_inc / learnts.size();    // Remove any clause below this activity
     
-    //sort(learnts, reduceDB_lt(ca));
+    sort(learnts, reduceDB_lt(ca));
+    int middle = learnts.size()/2;
     // Don't delete binary or locked clauses. From the rest, delete clauses from the first half
     // and clauses with activity smaller than 'extra_lim':
+    printf("c first clause: size %d, act %lf\n", ca[learnts[0]].size(), ca[learnts[0]].activity());
+    int n = learnts.size()-1;
+    printf("c last clause: size %d, act %lf\n", ca[learnts[n]].size(), ca[learnts[n]].activity());
     for (i = j = 0; i < learnts.size(); i++){
         Clause& c = ca[learnts[i]];
-        if (c.size() > 2 && !locked(c) && c.canBeDel() && c.activity() <= 0)
+        if (c.size() > 2 && !locked(c) && c.canBeDel() && i < middle )
             removeClause(learnts[i]);
         else{
             learnts[j++] = learnts[i];
@@ -1076,6 +1086,8 @@ lbool Solver::search(int nof_conflicts)
             if (decisionLevel() == 0 && !simplify())
                 return l_False;
 
+            if(learnts.size() > opt_maxDB)
+                reduceDB();
             //if (learnts.size()-nAssigns() >= max_learnts)
                 // Reduce the set of learnt clauses:
               //  reduceDB();
@@ -1101,9 +1113,14 @@ lbool Solver::search(int nof_conflicts)
                 decisions++;
                 next = pickBranchLit();
 
-                if (next == lit_Undef)
+                if (next == lit_Undef){
                     // Model found:
+                    lastTrail.clear();
+                    for(int i = 0 ; i < trail.size();i++)
+                        if(reason(var(trail[i])) == CRef_Undef)
+                            lastTrail.push(trail[i]);
                     return l_True;
+                }
             }
 
             // Increase decision level and enqueue 'next'
@@ -1186,11 +1203,14 @@ bool Solver::checkLiteral(Lit p){
 }
 
 bool Solver::checkLitFast(Lit l, vector<bool> & seenHere){
+    if(!ok)
+        return false;
     if(value(l) != l_Undef)
         return false;
     if(seenHere[toInt(l)])
         return false;
     newDecisionLevel();
+    assert(value(l) == l_Undef);
     uncheckedEnqueue(l);
     CRef confl = propagate();
 
@@ -1204,6 +1224,7 @@ bool Solver::checkLitFast(Lit l, vector<bool> & seenHere){
         return false;
     }
     else{
+        cancelUntil(0);
         uncheckedEnqueue(~l);
         confl = propagate();
         if(confl != CRef_Undef){
@@ -1217,8 +1238,9 @@ bool Solver::checkLitFast(Lit l, vector<bool> & seenHere){
 bool Solver::FL_Check_fast(){
     cancelUntil(0);
     vector<bool> seenHere(2*nVars(), false);
+    double t = cpuTime();
     int nBefore = trail.size();
-    for(int i = 0 ; i < nVars();i++){
+    for(int i = 0 ; i < nVars() && ok;i++){
         assert(0 == decisionLevel());
         if(checkLitFast(mkLit(i), seenHere))
             return false;
@@ -1227,6 +1249,7 @@ bool Solver::FL_Check_fast(){
             return false;
         assert(0 == decisionLevel());
     }
+    printf("c fixed %d variables, time was %lf\n", trail.size()-nBefore, cpuTime()-t);
     return trail.size() != nBefore;
 }
 
@@ -1241,7 +1264,7 @@ bool Solver::failedLiteralCheck(){
     assert(phase_saving == opt_phase_saving);
     int phaseBefore = phase_saving;
     phase_saving = 0;
-    
+    double t = cpuTime();
     /* Collect all literals that appear in clauses of size 2, as branching on others will not trigger BCP... */
     for(int i = 0 ; i < clauses.size();i++){
         int trueFound = 0;
@@ -1372,7 +1395,7 @@ bool Solver::failedLiteralCheck(){
             }
         }
     }
-    printf("fixed %d variables at DL0\n", trail.size()-nbSetBefore);
+    printf("fixed %d variables at DL0 in time %lf\n", trail.size()-nbSetBefore, cpuTime()-t);
     printf("Max # propagations: %d\n", maxProps);
     printf("MaxLit: %d\n", sign(maxLit) ? (- var(maxLit)) : var(maxLit));
     // Restore phase saving
@@ -1447,6 +1470,108 @@ void Solver::checkClausesUnterAssumptions(vec<Lit> & ass, set<vector<int> > & al
     cancelUntil(0);
 }
 
+bool Solver::check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec<Lit> & ass){
+    for(int i = 0 ; i < ass.size();i++){
+        if(value(ass[i]) == l_False){
+            printf("c got UNSAT during conditional FL check! \n");
+            return true;
+        }
+        else if(value(ass[i]) == l_Undef){
+            newDecisionLevel();
+            uncheckedEnqueue(ass[i]);
+            CRef confl = propagate();
+            if(confl != CRef_Undef){
+                printf("c got confl while propagating trail! \n");
+                return true;
+            }
+        }
+    }
+    if(value(l) == l_Undef && !seenHere[toInt(l)] ){
+        int dlBefore = decisionLevel();
+        newDecisionLevel();
+        uncheckedEnqueue(l);
+        CRef confl = propagate();
+        if(confl == CRef_Undef){
+            // mark all seen literals
+            for(int i = trail.size()-1 ; i >= 0 ; i--){
+                seenHere[toInt(trail[i])]=true;
+                if(level(var(trail[i])) < decisionLevel())
+                    break;
+            }
+            cancelUntil(dlBefore);
+        }
+        else{
+            int backtrack_level;
+            vec<Lit> learnt_clause;
+            analyze(confl, learnt_clause, backtrack_level);
+            int startDL = decisionLevel();
+            unsigned int LBD = computeLBD(learnt_clause);
+            cancelUntil(backtrack_level);
+            if (learnt_clause.size() == 1){
+                uncheckedEnqueue(learnt_clause[0]);
+                confl = propagate();
+                if(confl != CRef_Undef){
+                    printf("c got UNSAT??? \n");
+                    return true;
+                }
+            }else{
+                CRef cr = ca.alloc(learnt_clause, true);
+                learnts.push(cr);
+                attachClause(cr);
+                claBumpActivity(ca[cr]);
+                ca[cr].setGood(LBD <= dyn_threshold);
+                updateThreshold(ca[cr].isGoodClause());
+                //printf("c got clause of size %d, DL %d, backtrack to %d??? \n", learnt_clause.size(), decisionLevel(), backtrack_level);
+                int maxDL = 0;
+                for(int i = 0 ; i < learnt_clause.size();i++){
+                    if(value(learnt_clause[i]) != l_Undef){
+                        if(level(var(learnt_clause[i])) - 1 > maxDL)
+                            maxDL = level(var(learnt_clause[i]))-1;
+                    }
+                }
+                cancelUntil(maxDL);
+                int numFree = 0;
+                for(int i = 0 ; i < learnt_clause.size();i++)
+                    if(value(learnt_clause[i]) == l_Undef)
+                        numFree++;
+                if(numFree <= 1){
+                    printf("c this is weird. DL %d -> %d -> %d, clause has %d literals", startDL, backtrack_level, maxDL, learnt_clause.size());
+                }
+                assert(numFree > 1);
+                confl = propagate();
+                if(confl != CRef_Undef){
+                    printf("c got UNSAT after propagating this clause? this should not happen! \n");
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool Solver::FL_Check_With_Assumptions(vec<Lit> & ass){
+    cancelUntil(0);
+    double t = cpuTime();
+    if(!restoreTrail(ass)){
+        printf("c could not restore trail...\n");
+        return false;
+    }
+    int tsBefore = trail.size();
+    vector<bool> seenHere(2*nVars(), false);
+    for(int i = 0 ; i < nVars();i++){
+        if(check_lit_with_assumptions(mkLit(i), seenHere, ass))
+            return false;
+        if(check_lit_with_assumptions(~mkLit(i), seenHere, ass))
+            return false;
+    }
+    printf("c conditional FL check done! \n");
+    restoreTrail(ass);
+    printf("c trail size %d -> %d in time %lf\n", tsBefore, trail.size(), cpuTime()-t);
+    cancelUntil(0);
+    return true;
+
+}
+
 Lit    Solver::getNextBranchLit(vec<Lit> & ass)
 {
     cancelUntil(0);
@@ -1471,6 +1596,38 @@ Lit    Solver::getNextBranchLit(vec<Lit> & ass)
     cancelUntil(0);
     return next;
 }
+
+Lit Solver::getNextBranchLitFromList(vec<Lit> & ass, vec<Lit> & list){
+    assert(0 == decisionLevel());
+    cancelUntil(0);
+    for(int i = 0 ; i < ass.size();i++){
+        if(value(ass[i]) == l_Undef){
+            newDecisionLevel();
+            uncheckedEnqueue(ass[i]);
+            CRef confl = propagate();
+            if(confl != CRef_Undef){
+                printf("c got conflict while getting new cube! \n");
+                cancelUntil(0);
+                return lit_Undef;
+            }
+        }
+        else if(value(ass[i]) == l_False){
+            printf("c looking for cube, lit is false??? \n");
+            cancelUntil(0);
+            return lit_Undef;
+        }
+    }
+    Lit rVal = lit_Undef;
+    for(int i = 0 ; i < list.size();i++){
+        if(value(list[i]) == l_Undef){
+            rVal = list[i];
+            break;
+        }
+    }
+    cancelUntil(0);
+    return rVal;
+}
+
 bool    Solver::restoreTrail(vec<Lit> & ass){
     cancelUntil(0);
     for(int i = 0 ; i < ass.size();i++){
@@ -1502,6 +1659,7 @@ void Solver::updateProgress(int length, vector<int> & progress){
             progress[length]=1;
             break;
         }
+        length--;
     }
     double sum = 0.0;
     for(int i = 0 ; i < progress.size();i++){
@@ -1511,10 +1669,284 @@ void Solver::updateProgress(int length, vector<int> & progress){
     printf("c progress: %lf\n", sum);
 }
 
+void Solver::initMPIStuff(){
+    MPI_Init(NULL, NULL);
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_num_ranks);
+    int buf_size = 100 * 1000 * 1000 * sizeof(int);
+    int * my_buffer = (int*) malloc(buf_size);
+    assert(my_buffer);
+    MPI_Buffer_attach(my_buffer, buf_size);
+}
+
+void Solver::initParameters(){
+    printf("c TODO: Adjust parameters! \ņ");
+    //assert(false && "TODO");
+
+}
+
+bool Solver::failedCube(int * arr, int n, int sender){
+    int cubeLength = arr[0];
+    int conflLength = arr[1];
+    vec<Lit> failedCube;
+    vec<Lit> conflict;
+    for(int i = 0 ; i < cubeLength ; i++)
+        failedCube.push(toLit(arr[2+i]));
+    for(int i = 0 ; i < conflLength ; i++){
+        conflict.push(toLit(arr[2+cubeLength+i]));
+    }
+    addClause(conflict);
+    // TODO: Send failed cube to all other solvers!
+    return false;
+}
+void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_slave_indices, map<int, vector<int> > & lastCubes){
+    printf("c looking for job for slave\n");
+    int nextSlave = idle_slave_indices.back();
+    idle_slave_indices.pop_back();
+    // Get the next job:
+    int shortestFoundIndex = 0;
+    int longestPrefix = 0;
+    int bestIndex = -1;
+    printf("c chose slave %d\n", nextSlave);
+    for(int i = 0 ; i < open_cubes.size();i++){
+        if(open_cubes[i].size() < open_cubes[shortestFoundIndex].size())
+            shortestFoundIndex = i;
+        if(lastCubes.find(nextSlave) != lastCubes.end()){
+            int sz = 0;
+            vector<int> & lastPref = lastCubes[nextSlave];
+            for(int j = 0 ; j < lastPref.size() && j < open_cubes[i].size() && open_cubes[i][j] == lastPref[j] ; j++)
+                sz++;
+            if(sz > longestPrefix){
+                longestPrefix = sz;
+                bestIndex = i;
+            }
+
+        }
+    }
+    vector<int> nextCube;
+    if(open_cubes[shortestFoundIndex].size() < 10 || bestIndex < 0){
+        nextCube.insert(nextCube.end(), open_cubes[shortestFoundIndex].begin(), open_cubes[shortestFoundIndex].end());
+        open_cubes[shortestFoundIndex] = open_cubes.back();
+        open_cubes.pop_back();
+    }
+    else{
+        nextCube.insert(nextCube.end(), open_cubes[bestIndex].begin(), open_cubes[bestIndex].end());
+        open_cubes[bestIndex] = open_cubes.back();
+        open_cubes.pop_back();
+    }
+    int arr[nextCube.size()];
+    for(int i = 0 ; i < nextCube.size();i++)
+        arr[i] = nextCube[i];
+    lastCubes[nextSlave] = nextCube;
+    printf("c sending cube to %d : ", nextSlave);
+    for(int i = 0 ; i < nextCube.size();i++)
+        printf("%d ", nextCube[i]);
+    printf("\n");
+    MPI_Bsend(arr, nextCube.size(), MPI_INT, nextSlave, TAG_NEW_CUBE_FOR_SLAVE, MPI_COMM_WORLD);
+}
+
+bool Solver::master_solve(){
+    vector<vector<int> > open_cubes;
+    vector<int> progress;
+    open_cubes.push_back(vector<int>());
+    vector<int> idle_slave_indices;
+    vec<Lit> guide_to_sat;
+    map<int, vector<int> > lastCube;
+    bool done = false;
+    bool foundSAT = false;
+    while(!done){
+        if(open_cubes.size() > 0 && idle_slave_indices.size() > 0){
+            // Pick a solver and send next cube:
+            sendNextJob(open_cubes, idle_slave_indices, lastCube);
+        }
+        MPI_Status s;
+        int received;
+        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &received, &s);
+        if(received){
+            int length;
+            switch(s.MPI_TAG){
+                case TAG_CUBE_REQUEST:
+                    MPI_Get_count(&s, MPI_INT, &length);
+                    int dummy;
+                    assert(length <= 1);
+                    MPI_Recv(&dummy, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+                    printf("c solver %d requested cube! \n", s.MPI_SOURCE);
+                    idle_slave_indices.push_back(s.MPI_SOURCE);
+                break;
+            case TAG_SAT_ANSWER:{
+                MPI_Get_count(&s, MPI_INT, &length);
+                int  arr[length]; // = (int*) malloc(length * sizeof(int));
+                MPI_Recv(arr, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+                foundSAT = true;
+                done = true;
+                guide_to_sat.clear();
+                for(int i = 0 ; i < length ; i++)
+                    guide_to_sat.push(toLit(arr[i]));
+                printf("c received partial solution from %d\n", s.MPI_SOURCE);
+                break;
+            }
+            case TAG_UNSAT_ANSWER:
+            {
+                MPI_Get_count(&s, MPI_INT, &length);
+                int  arr [length]; // = (int*) malloc(length * sizeof(int));
+                MPI_Recv(arr, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+                failedCube(arr, length, s.MPI_TAG);
+                updateProgress(arr[0], progress);
+                break;
+            }
+            case TAG_NEW_CUBE_FOR_MASTER:
+            {
+                MPI_Get_count(&s, MPI_INT, &length);
+                int  arr [length]; // = (int*) malloc(length * sizeof(int));
+                MPI_Recv(arr, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+                vector<int> newCube;
+                printf("c master received new cube from %d: ", s.MPI_SOURCE);
+                for(int i = 0 ; i < length ; i++){
+                    newCube.push_back(arr[i]);
+                    printf("%d ", arr[i]);
+                }
+                printf("\n");
+                open_cubes.push_back(newCube);
+                break;
+            }
+            default:
+                printf("c master received weird message: %d\n", s.MPI_TAG);
+                // MPI_Get_count(&s, MPI_INT, &length);
+                // MPI_Recv(arr, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+            }
+        }
+        else{
+            usleep(2000);
+        }
+    // Am I done?
+        if(idle_slave_indices.size() == mpi_num_ranks-1 && open_cubes.size() == 0 && progress.size() > 0){
+            printf("c checking progress...\n");
+            assert(progress[0] == 1);
+            done = true;
+        }
+    }
+    for(int i = 1 ; i < mpi_num_ranks ; i++)
+        MPI_Bsend(NULL, 0, MPI_INT, i, TAG_TERMINATE, MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if(foundSAT){
+        solveLimited(guide_to_sat);
+        return true;
+    }
+    return false;
+}
+
+void Solver::slave_solve(vec<Lit> & firstCubes){
+    verbosity = 0;
+    bool done = false;
+    MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
+    while(!done){
+        MPI_Status s;
+        int received;
+        MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &received, &s);
+        if(received){
+            int length;
+            switch(s.MPI_TAG){
+            case TAG_NEW_CUBE_FOR_SLAVE:
+            {
+
+                MPI_Get_count(&s, MPI_INT, &length);
+                int  arr[length];
+                printf("c received cube of size %d\n", length);
+                MPI_Recv(arr, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+                vec<Lit> ass;
+                for(int i = 0 ; i < length ; i++)
+                    ass.push(toLit(arr[i]));
+                if(length < 4)
+                    setConfBudget(1000);
+                else{
+                    setConfBudget(opt_numConfls);
+                }
+                printf("c slave %d calling solve\n",mpi_rank );
+                int conflsBefore = conflicts;
+                lbool ret = solveLimited(ass);
+                printf("c solve done, had %d conflicts\n", conflicts - conflsBefore);
+                if(ret == l_False){
+                    printf("c cube failed\n");
+                    int arr[2 + conflict.size() + ass.size()];
+                    arr[0] = ass.size();
+                    arr[1] = conflict.size();
+                    for(int i = 0 ; i < ass.size();i++)
+                        arr[2+i] = toInt(ass[i]);
+                    for(int i = 0 ; i < conflict.size();i++)
+                        arr[2+ass.size()+i] = toInt(conflict[i]);
+                    MPI_Bsend(arr, ass.size() + conflict.size()+2, MPI_INT, 0, TAG_UNSAT_ANSWER, MPI_COMM_WORLD);
+                    MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
+
+                }
+                else if(ret == l_True){
+                    printf("c got SAT, lastTrail.size()=%d\n", lastTrail.size());
+                    int arr[lastTrail.size()];
+                    for(int i = 0 ; i < lastTrail.size();i++)
+                        arr[i] = toInt(lastTrail[i]);
+                    MPI_Bsend(arr, lastTrail.size() + conflict.size()+2, MPI_INT, 0, TAG_SAT_ANSWER, MPI_COMM_WORLD);
+                }
+                else{
+                    printf("c cube not solved, sending answer to master! \n");
+                    Lit next = getNextBranchLitFromList(ass, firstCubes);
+                    if(next == lit_Undef)
+                        next = getNextBranchLit(ass);
+                    if(next == lit_Undef){
+                        // Send this cube back to the solver
+                    }
+                    else{
+                        int arr1[length+1];
+                        int arr2[length+1];
+                        for(int i = 0 ; i < ass.size();i++){
+                            arr1[i] = arr2[i] = toInt(ass[i]);
+                        }
+                        arr1[length] = toInt(next);
+                        arr2[length] = toInt(~next);
+                        MPI_Bsend(arr1, length+1, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
+                        MPI_Bsend(arr2, length+1, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
+                        MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
+                    }
+                }
+            }
+                break;
+            case TAG_TERMINATE:
+                done = true;
+                break;
+            default:
+                printf("c received weird tag %d\n", s.MPI_TAG);
+                break;
+            }
+        }
+        else{
+            usleep(1000);
+        }
+    }
+    printf("c slave %d at barrier! \n", mpi_rank);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+}
+
+lbool Solver::mpi_solve(vec<Lit> & firstCubes){
+    // init all stuff
+    initMPIStuff();
+    // init parameter
+    initParameters();
+    if(mpi_rank == 0){
+        bool succ = master_solve();
+        if(succ){
+            return l_True;
+        }
+    }
+    else{
+        slave_solve(firstCubes);
+    }
+    return l_False;
+}
+
 lbool Solver::DFS_Solve(vec<Lit> & firstCubes){
     vector<vector<int> > cubes;
     vector<int> progress;
-    if(firstCubes.size() > 0){
+    /*if(firstCubes.size() > 0){
         for(int i = 0 ; i < (1<<firstCubes.size()) ; i++){
             vector<int> v;
             for(int j = 0 ; j < firstCubes.size();j++){
@@ -1528,9 +1960,10 @@ lbool Solver::DFS_Solve(vec<Lit> & firstCubes){
         }
 
     }
-    else
-        cubes.push_back(vector<int>());
+    else*/
+    cubes.push_back(vector<int>());
     bool done = false;
+    bool hadUnSAT = false;
     verbosity = 0;
     int numChecked = 0;
     while(!done){
@@ -1559,25 +1992,47 @@ lbool Solver::DFS_Solve(vec<Lit> & firstCubes){
         vec<Lit> ass;
         for(int i = 0 ; i < v.size();i++)
             ass.push(toLit(v[i]));
-        setConfBudget(numChecked < 128 ? 10 * 1000 : 50 * 1000);
-        checkClausesUnterAssumptions(ass, tmpSet, tmpBinaries, numDupl);
+        int confBudget = opt_numConfls;
+        if(getNextBranchLitFromList(ass, firstCubes) != lit_Undef){
+            if(!hadUnSAT)
+                confBudget = 1000;
+            else
+                confBudget = opt_numConfls/4;
+        }
+        else{
+            FL_Check_With_Assumptions(ass);
+        }
+        printf("c setting conf Budget to %d\n", confBudget);
+        setConfBudget(confBudget);
+        //checkClausesUnterAssumptions(ass, tmpSet, tmpBinaries, numDupl);
+        //printf("c calling FL check with assumptions! ")
+        double t = cpuTime();
+        int conflsBefore = conflicts;
         lbool ret = solveLimited(ass);
         if(ret == l_True)
             return l_True;
         else if(ret == l_False){
+            hadUnSAT = true;
             printf("c cube of size %d is UNSAT! ", ass.size());
             for(int i = 0 ; i < v.size();i++){
                 printf("%d ", (v[i] % 2 == 0) ? v[i]/2 : -v[i]/2);
             }
             printf("\n");
             printf("c conflict size %d\n", conflict.size());
+            printf("c time was %lf, conflicts %d\n", cpuTime()-t, conflicts - conflsBefore);
             if(conflict.size() == 0)
                 done = true;
             updateProgress(ass.size(), progress);
             addClause(conflict);
+            if(conflict.size() <= 2){
+                cancelUntil(0);
+                FL_Check_fast();
+            }
         }
         else{
-            Lit next = getNextBranchLit(ass);
+            Lit next = getNextBranchLitFromList(ass, firstCubes);
+            if(next == lit_Undef)
+                next = getNextBranchLit(ass);
             if(next == lit_Undef)
                 cubes.push_back(v);
             else{
@@ -1658,9 +2113,9 @@ lbool Solver::solve_()
     dyn_threshold = opt_ThresholdPermanent;
     target_rate = opt_target_rate;
     // Search:
-    if(assumptions.size() > 0){
+    /*if(assumptions.size() > 0){
         reduceDB_with_assumptions(assumptions);
-    }
+    }*/
     int curr_restarts = 0;
     int calls = 0;
     while (status == l_Undef){

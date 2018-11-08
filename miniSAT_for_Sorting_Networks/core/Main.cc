@@ -1196,6 +1196,21 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
                 }
             }
         }
+        // If there is a comparator (i,j) in layer l, then there is no comparator (i,j) in layer l+1
+        for(int l = maxFixedPrefLayer ; l < d - 1 ; l++){
+            for(int i = 0 ; i < n ; i++){
+                for(int j = i+1 ; j < n ; j++){
+                    if(compVars.count(comparator(l,i,j))){
+                        if(compVars.count(comparator(l+1, i,j))){
+                            vec<Lit> ps;
+                            ps.push(~mkLit(compVars[comparator(l,i,j)]));
+                            ps.push(~mkLit(compVars[comparator(l+1,i,j)]));
+                            s.addClause(ps);
+                        }
+                    }
+                }
+            }
+        }
     }
     else if(createSplitModule){
         if(opt_lastLayerHC){
@@ -1529,6 +1544,16 @@ int getNumOnes(int val, int n){
     return ret;
 }
 
+
+int countNumOnes(int v){
+    int ret = 0;
+    for(int i = 0 ; i < 24 ; i++)
+        if(v & (1<<i))
+            ret++;
+    return ret;
+}
+
+
 /**********************************************************************
  * Initialize the solver with some inputs.
  * */
@@ -1603,12 +1628,19 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
     int toAdd = opt_minNumInputs;
     printf("Starting to add inputs, windowSize2Add=%d, opt_minNumInputs=%d\n", windowSize2Add, toAdd);
     printf("Chose %d out of %d\n", possibleInputs.size(), inputsToAdd.size());
+    int iters = 0;
+    vector<int> numOnes(n+1, 0);
     for (vector<testInput>::iterator it = possibleInputs.begin(); it != possibleInputs.end(); it++) {
+        iters++;
+        //if(iters % 100 == 0){
+         //   printf("c added %d inputs, now %d vars, %d clauses! \n", iters, s.nVars(), s.nClauses());
+        //}
         if (it->windowSize > windowSize2Add && added >= toAdd)
             break;
         if (it->windowSize > 0) {
             // Skip sorted inputs
             vector<bool> inputs;
+            numOnes[countNumOnes(it->input)]++;
             for (int j = 0; j < n; j++) {
                 inputs.push_back((it->input & (1 << j)) != 0);
             }
@@ -1622,11 +1654,14 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
         }
     }
 
-    printf("Added %d inputs\n", added);
+    printf("c Added %d inputs\n", added);
+    for(int i = 0 ; i < numOnes.size() ; i++)
+        printf("c inputs with %d ones: %d\n", i, numOnes[i] );
     bool fCheckDone = false;
     while (!fCheckDone) {
         int freeBefore = s.nFreeVars();
-        s.failedLiteralCheck();
+        s.FL_Check_fast();
+        //s.failedLiteralCheck();
         fCheckDone = s.nFreeVars() == freeBefore;
     }
     //s.toDimacs("formula.cnf");
@@ -1634,13 +1669,13 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
 
 bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
 
-    s.failedLiteralCheck();
+    //s.failedLiteralCheck();
     if (iteration >= 0) {
         double t_failed = cpuTime();
         // Use failed literal check less often if solutions are counted...
         if (iteration % 10 == 1 && (!false || iteration < 1000)) {
 
-            s.failedLiteralCheck();
+           // s.failedLiteralCheck();
             printf("Failed literal check took %5.3lf s\n", cpuTime() - t_failed);
         }
     }
@@ -1649,7 +1684,9 @@ bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
     bool netWorkCreated = false;
     while (!done) {
         s.budgetForRandom = 0;
-        lbool test = s.DFS_Solve(firstCubes);
+        lbool test = s.mpi_solve(firstCubes); // s.DFS_Solve(firstCubes);
+        if(test != l_True)
+            return false;
         bool solved = s.solve(allAssumptions);
         if (solved) {
             done = true;
@@ -1920,12 +1957,19 @@ void testTheseVars(Solver & s, int index, vector<int> & testVars, int numConfls,
     }
 }
 
-int countNumOnes(int v){
-    int ret = 0;
-    for(int i = 0 ; i < 24 ; i++)
-        if(v & (1<<i))
-            ret++;
-    return ret;
+
+
+void addTestLiterals(int layer, int minFrom, int maxTo, int maxLength, triVarMap &compVarsInCreatedNW){
+    for(int i = minFrom ; i < maxTo ; i++){
+        for(int j = maxLength ; j >= 1  ; j--){
+            int from = i;
+            int to = i+j;
+            if(to <= maxTo && compVarsInCreatedNW.count(comparator(layer, from, to))){
+                printf("c layer %d : %d -> %d varIndex is %d\n", layer, from, to, compVarsInCreatedNW[comparator(layer, from,to)]);
+                firstCubes.push(mkLit(compVarsInCreatedNW[comparator(layer, from, to)]));
+            }
+        }
+    }
 }
 
 void testLastLayerStuff(Solver & s, int n, int d,triVarMap &compVarsInCreatedNW,
@@ -2130,11 +2174,33 @@ int main(int argc, char **argv) {
                 printf("looking for a feasible network: \n");
                 double t_ = cpuTime();
                 netWorkCreate.toDimacs("bla.cnf");
-                if(n == 18 && d == 10){
-                    if(compVarsInCreatedNW.count(comparator(8, 8, 11))){
+                if(n >= 16 ){
+                    int minFrom = 5;
+                    int maxTo = n-5;
+                    // Last layer:
+                    addTestLiterals(d-2, minFrom, maxTo, 3,compVarsInCreatedNW);
+                    addTestLiterals(d-1, minFrom, maxTo, 1,compVarsInCreatedNW);
+                    addTestLiterals(d-3, minFrom, maxTo, 8,compVarsInCreatedNW);
+                    /*int nStart = n/2 - 3;
+                    for(int i = 0 ; i < 4 ; i++){
+                        for(int k = 1 ; k <= 3 ; k++){
+                            int from = nStart + i;
+                            int to = from + k;
+                            if(compVarsInCreatedNW.count(comparator(d-2, from ,to))){
+                                printf("c %d -> %d varIndex is %d\n", from, to, compVarsInCreatedNW[comparator(d-2, from, to)]);
+                                firstCubes.push(mkLit(compVarsInCreatedNW[comparator(d-2, from, to)]));
+                            }
+                        }
+
+
+                    }*/
+                    //for(int i = 0 ; i < 4 ; i++)
+                        //if(compVarsInCreatedNW.count(comparator(d-2, n/2-2+i, n/2+1+i)))
+                            //firstCubes.push(mkLit(compVarsInCreatedNW[comparator(d-2, n/2-2+i, n/2+1+i)]));
+                    /*if(compVarsInCreatedNW.count(comparator(8, 8, 11))){
                         firstCubes.push(mkLit(compVarsInCreatedNW[comparator(8, 8, 11)]));
                         firstCubes.push(mkLit(compVarsInCreatedNW[comparator(8, 10, 13)]));
-                    }
+                    }*/
 
                 }
                 bool newNetWorkCreated = findFeasibleNetwork(netWorkCreate, iterations);

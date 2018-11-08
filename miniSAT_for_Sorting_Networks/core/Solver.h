@@ -30,6 +30,14 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include <map>
 #include <set>
 #include <vector>
+
+#define TAG_CUBE_REQUEST            1
+#define TAG_SAT_ANSWER              2
+#define TAG_UNSAT_ANSWER            3
+#define TAG_NEW_CUBE_FOR_SLAVE      4
+#define TAG_TERMINATE               5
+#define TAG_NEW_CUBE_FOR_MASTER     6
+
 namespace Minisat {
 
 //=================================================================================================
@@ -172,11 +180,24 @@ public:
     bool entailed(vec<Lit> & c);
     lbool   DFS_Solve(vec<Lit> & firstCubes);
     Lit     getNextBranchLit(vec<Lit> & ass);
+    Lit     getNextBranchLitFromList(vec<Lit> & ass, vec<Lit> & list);
     bool FL_Check_fast();
     bool checkLitFast(Lit l, std::vector<bool> & seenHere);
+    bool check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec<Lit> & ass);
+    bool FL_Check_With_Assumptions(vec<Lit> & ass);
     bool    restoreTrail(vec<Lit> & ass);
     void updateProgress(int length, std::vector<int> & progress);
     void checkClausesUnterAssumptions(vec<Lit> & ass, std::set<std::vector<int> > & allClauses, std::set<std::pair<int, int> > & binaries, int & duplicates);
+    int mpi_rank;
+    int mpi_num_ranks;
+    lbool mpi_solve(vec<Lit> & firstCubes);
+    void initMPIStuff();
+    void initParameters();
+    bool master_solve();
+    void slave_solve(vec<Lit> & firstCubes);
+    void sendNextJob(std::vector<std::vector<int> > & open_cubes, std::vector<int> & idle_slave_indices, std::map<int, std::vector<int> > & lastCubes);
+    bool failedCube(int * arr, int n, int sender);
+    vec<Lit> lastTrail;
 protected:
 
     // Helper structures:
