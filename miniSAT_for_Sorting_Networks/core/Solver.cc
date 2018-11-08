@@ -1680,7 +1680,7 @@ void Solver::initMPIStuff(){
 }
 
 void Solver::initParameters(){
-    printf("c TODO: Adjust parameters! \ņ");
+    printf("c TODO: Adjust parameters! \n");
     //assert(false && "TODO");
 
 }
