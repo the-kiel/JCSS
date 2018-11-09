@@ -37,6 +37,10 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #include <set>
 #include <algorithm>
 #include <fstream>
+#include <mpi.h>
+
+int myMPI_rank  = -1;
+int num_mpi_ranks = 0;
 
 using namespace Minisat;
 using namespace std;
@@ -58,6 +62,7 @@ static BoolOption opt_create_splitter("MAIN", "splitter", "Create a network whic
 static BoolOption opt_llGuess("MAIN", "llGuess", "Make the guess that the last layer is similar to a half cleaner", false);
 static IntOption opt_maxPrefLayer("MAIN", "maxPrefLayer", "Max layer to use from input.\n", 10,
                            IntRange(0, INT32_MAX));
+static BoolOption opt_mpi("MAIN", "useMPI", "Use the parallel version", true);
 
 
 static BoolOption opt_shortComps("MAIN", "shortComps", "Add clauses which enfoce each comparator (i,i+1) to be used", true);
@@ -627,7 +632,7 @@ vector<vector<comparator> > allPrefixes;
 void parseSecondlayer(vector<comparator> &out, const char *fileName, int row) {
     FILE *fp = fopen(fileName, "r");
     allPrefixes.clear();
-    printf("c parse called! \n");
+    if(myMPI_rank <= 0) printf("c parse called! \n");
     int BUF_SIZE = 1024;
     char buffer[BUF_SIZE];
     int rowRead = 0;
@@ -656,7 +661,7 @@ void parseSecondlayer(vector<comparator> &out, const char *fileName, int row) {
         if(tmp.size() > 0)
             allPrefixes.push_back(tmp);
     }
-    printf("c Parsed %d prefixes...\n", allPrefixes.size() );
+    if(myMPI_rank <= 0) printf("c Parsed %d prefixes...\n", allPrefixes.size() );
     out.clear();
     vector<comparator> & toAdd = allPrefixes[row];
     for(int i = 0 ; i < toAdd.size();i++){
@@ -1116,11 +1121,13 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
     int maxFixedPrefLayer = -1;
     if (opt_prefLayer) {
         const char *_prefFileName = prefFileName ? (const char *) prefFileName : "layers.txt";
-        printf("Reading input from %s\n", _prefFileName);
+        if(myMPI_rank <= 0) printf("Reading input from %s\n", _prefFileName);
         vector<comparator> secondlayer;
         parseSecondlayer(secondlayer, _prefFileName, opt_row);
-        printf("c prefix: \n");
-        printComps(secondlayer, n, d);
+        if(myMPI_rank <= 0){
+            printf("c prefix: \n");
+            printComps(secondlayer, n, d);
+        }
         // if nothing was read, try "Parberry" first layer
         if (secondlayer.size() == 0) {
             for (int i = 0; i < n; i += 2) {
@@ -1142,18 +1149,18 @@ void createNetWorkFormula(Solver &s, int n, int d, map<comparator, Var> &compVar
             ps.push(mkLit(compVars[*it]));
             s.addClause(ps);
             ps.clear();
-            printf("Forcing %d: %d -> %d\n", it->layer, it->minchan, it->maxchan);
+            if(myMPI_rank <= 0) printf("Forcing %d: %d -> %d\n", it->layer, it->minchan, it->maxchan);
             highestLayerInFile = max(highestLayerInFile, it->layer);
         }
         maxFixedPrefLayer = highestLayerInFile;
-        printf("Setting maxFixedPrefLayer=%d\n", maxFixedPrefLayer);
+        if(myMPI_rank <= 0) printf("Setting maxFixedPrefLayer=%d\n", maxFixedPrefLayer);
         for (int i = 0; i < d && i <= highestLayerInFile; i++) {
             for (int j = 0; j < n; j++) {
                 if (usedWiresInLayer.count(make_pair(i, j)) == 0) {
                     vec<Lit> ps;
                     ps.push(~mkLit(used[make_pair(i, j)]));
                     s.addClause(ps);
-                    printf("Forcing used[%d,%d]=false  (%d, %d)\n", i, j, used[make_pair(i, j)], ps.size());
+                    if(myMPI_rank <= 0) printf("Forcing used[%d,%d]=false  (%d, %d)\n", i, j, used[make_pair(i, j)], ps.size());
                 }
             }
         }
@@ -1563,12 +1570,12 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
 
     // intputs with k leading zeros
     int added = 0;
-    printf("Window size: %d\n", n - k);
+    if(myMPI_rank <= 0) printf("Window size: %d\n", n - k);
     map<comparator, Var> internalVars;
     // map: Input -> Vector after first two layers
     map<int, int> inputsToAdd;
 
-    printf("Creating inputs, read %d comparators from file\n", compsReadFromFile.size());
+    if(myMPI_rank <= 0) printf("Creating inputs, read %d comparators from file\n", compsReadFromFile.size());
     // Small change: Get ALL possible outputs of the prefix here
     bool useAllPrefixes = false;
     set<int> inputsSeen;
@@ -1626,8 +1633,8 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
 
     int windowSize2Add = n - k;
     int toAdd = opt_minNumInputs;
-    printf("Starting to add inputs, windowSize2Add=%d, opt_minNumInputs=%d\n", windowSize2Add, toAdd);
-    printf("Chose %d out of %d\n", possibleInputs.size(), inputsToAdd.size());
+    if(myMPI_rank <= 0) printf("Starting to add inputs, windowSize2Add=%d, opt_minNumInputs=%d\n", windowSize2Add, toAdd);
+    if(myMPI_rank <= 0) printf("Chose %d out of %d\n", possibleInputs.size(), inputsToAdd.size());
     int iters = 0;
     vector<int> numOnes(n+1, 0);
     for (vector<testInput>::iterator it = possibleInputs.begin(); it != possibleInputs.end(); it++) {
@@ -1654,9 +1661,11 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
         }
     }
 
-    printf("c Added %d inputs\n", added);
-    for(int i = 0 ; i < numOnes.size() ; i++)
-        printf("c inputs with %d ones: %d\n", i, numOnes[i] );
+    if(myMPI_rank <= 0) {
+        printf("c Added %d inputs\n", added);
+        for(int i = 0 ; i < numOnes.size() ; i++)
+            printf("c inputs with %d ones: %d\n", i, numOnes[i] );
+    }
     bool fCheckDone = false;
     while (!fCheckDone) {
         int freeBefore = s.nFreeVars();
@@ -1676,7 +1685,7 @@ bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
         if (iteration % 10 == 1 && (!false || iteration < 1000)) {
 
            // s.failedLiteralCheck();
-            printf("Failed literal check took %5.3lf s\n", cpuTime() - t_failed);
+            if(myMPI_rank <= 0)printf("Failed literal check took %5.3lf s\n", cpuTime() - t_failed);
         }
     }
 
@@ -1684,9 +1693,14 @@ bool findFeasibleNetwork(Solver &s, int iteration, vec<Lit> &allAssumptions) {
     bool netWorkCreated = false;
     while (!done) {
         s.budgetForRandom = 0;
-        lbool test = s.mpi_solve(firstCubes); // s.DFS_Solve(firstCubes);
-        if(test != l_True)
-            return false;
+        if(opt_mpi ){
+            s.mpi_rank = myMPI_rank;
+            s.mpi_num_ranks = num_mpi_ranks;
+            lbool test = s.mpi_solve(firstCubes); // s.DFS_Solve(firstCubes);
+            if(test != l_True)
+                return false;
+            return true;
+        }
         bool solved = s.solve(allAssumptions);
         if (solved) {
             done = true;
@@ -1965,7 +1979,7 @@ void addTestLiterals(int layer, int minFrom, int maxTo, int maxLength, triVarMap
             int from = i;
             int to = i+j;
             if(to <= maxTo && compVarsInCreatedNW.count(comparator(layer, from, to))){
-                printf("c layer %d : %d -> %d varIndex is %d\n", layer, from, to, compVarsInCreatedNW[comparator(layer, from,to)]);
+                if(myMPI_rank <= 0) printf("c layer %d : %d -> %d varIndex is %d\n", layer, from, to, compVarsInCreatedNW[comparator(layer, from,to)]);
                 firstCubes.push(mkLit(compVarsInCreatedNW[comparator(layer, from, to)]));
             }
         }
@@ -2001,6 +2015,8 @@ void testLastLayerStuff(Solver & s, int n, int d,triVarMap &compVarsInCreatedNW,
 
 
 int main(int argc, char **argv) {
+
+
     setbuf(stdout, NULL);
     try {
         setUsageHelp(
@@ -2009,7 +2025,7 @@ int main(int argc, char **argv) {
 #if defined(__linux__)
         fpu_control_t oldcw, newcw;
         _FPU_GETCW(oldcw); newcw = (oldcw & ~_FPU_EXTENDED) | _FPU_DOUBLE; _FPU_SETCW(newcw);
-        printf("WARNING: for repeatability, setting FPU to use double precision\n");
+        //if(myMPI_rank <= 0) printf("WARNING: for repeatability, setting FPU to use double precision\n");
 #endif
         // Extra options:
         //
@@ -2032,6 +2048,21 @@ int main(int argc, char **argv) {
 
 
         parseOptions(argc, argv, true);
+
+        if(opt_mpi){
+            MPI_Init(NULL, NULL);
+            MPI_Comm_rank(MPI_COMM_WORLD, &myMPI_rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &num_mpi_ranks);
+            int buf_size = 100 * 1000 * 1000 * sizeof(int);
+            int * my_buffer = (int*) malloc(buf_size);
+            assert(my_buffer);
+            MPI_Buffer_attach(my_buffer, buf_size);
+            printf("c init MPI done, rank %d, numRanks %d\n", myMPI_rank, num_mpi_ranks);
+        }
+        else{
+            myMPI_rank = 0;
+            printf("c running without MPI, my rank is %d\n", myMPI_rank);
+        }
 
         double initial_time = cpuTime();
         const char *_prefFileName = prefFileName ? (const char *) prefFileName : "layers.txt";
@@ -2075,8 +2106,8 @@ int main(int argc, char **argv) {
         int d = layers;
         double overAllTimeForNetworkCheck = 0.0;
         double overAllTimeForNetworkCreation = 0.0;
-        printf("=========================================================\n");
-        printf("=== Looking for Sorting networks for %d bits with depth %d\n", n, d);
+        if(myMPI_rank <= 0) printf("=========================================================\n");
+        if(myMPI_rank <= 0) printf("=== Looking for Sorting networks for %d bits with depth %d\n", n, d);
 
         /******************************************************
         * create a solver to compare two networks: 
@@ -2096,23 +2127,23 @@ int main(int argc, char **argv) {
             outputVarsForTest.push_back(netWorksCompare.newVar());
         }
         assert(netWorksCompare.nVars() > 0);
-        printf("Vectors created, numVars=%d\n", netWorksCompare.nVars());
+        if(myMPI_rank <= 0) printf("Vectors created, numVars=%d\n", netWorksCompare.nVars());
         /* create a reference-network - in this case, it's simply an odd-even-sort */
         createRefNetwork(netWorksCompare, inputVars, outputVarsForRev, n, n, innerVars1);
-        printf("First Network created, numVars=%d\n", netWorksCompare.nVars());
+        if(myMPI_rank <= 0) printf("First Network created, numVars=%d\n", netWorksCompare.nVars());
 
         /* create a configurable network */
         map<comparator, Var> compVarsInTestNW;
         map<pair<int, int>, Var> internalTestVars;
         createTestNetWork(netWorksCompare, inputVars, outputVarsForTest, n, d, compVarsInTestNW, internalTestVars);
         //createRefNetwork(netWorksCompare, inputVars, outputVarsForTest, n, n, innerVars2);
-        printf("Second Network created, numVars=%d\n", netWorksCompare.nVars());
+        if(myMPI_rank <= 0) printf("Second Network created, numVars=%d\n", netWorksCompare.nVars());
         // create "atLeastOneDiffers"-Constraint: 
         vector<Var> diffVars;
         addAtLeastOneDiffers(netWorksCompare, outputVarsForRev, outputVarsForTest, diffVars);
 
 
-        printf("Got so far, numVars = %d\n", netWorksCompare.nVars());
+        if(myMPI_rank <= 0) printf("Got so far, numVars = %d\n", netWorksCompare.nVars());
 
         /*************************************************************************************
          * Create Solver and formula which create a network which sorts the given inputs
@@ -2157,7 +2188,7 @@ int main(int argc, char **argv) {
                 for (vector<comparator>::iterator it = compsReadFromFile.begin(); it != compsReadFromFile.end(); it++) {
                     maxLayerReadFromFile = std::max(maxLayerReadFromFile, it->layer);
                 }
-                printf("Max layer in input: %d\n", maxLayerReadFromFile);
+                if(myMPI_rank <= 0) printf("Max layer in input: %d\n", maxLayerReadFromFile);
                 addSomeInputs(netWorkCreate, compsReadFromFile, n, d, compVarsInCreatedNW, used, T, F,
                               internalVarsInCreatedNW, shrinkGen, rangeVars);
 
@@ -2165,15 +2196,15 @@ int main(int argc, char **argv) {
 
 
             int maxWindowSoFar = 1;
-            printf("c starting loop,netWorkCreate.okay = %d\n", netWorkCreate.okay());
+            if(myMPI_rank <= 0) printf("c starting loop,netWorkCreate.okay = %d\n", netWorkCreate.okay());
             while (!done) {
                 // Create network
-                printf("\n\n================================================================================\n");
-                printf("Iteration %d\n", ++iterations);
-                printf("Internal vars: %d and %d\n", compVarsInCreatedNW.size(), compVarsInTestNW.size());
-                printf("looking for a feasible network: \n");
+                if(myMPI_rank <= 0) printf("\n\n================================================================================\n");
+                if(myMPI_rank <= 0) printf("Iteration %d\n", ++iterations);
+                if(myMPI_rank <= 0) printf("Internal vars: %d and %d\n", compVarsInCreatedNW.size(), compVarsInTestNW.size());
+                if(myMPI_rank <= 0) printf("looking for a feasible network: \n");
                 double t_ = cpuTime();
-                netWorkCreate.toDimacs("bla.cnf");
+                if(myMPI_rank <= 0) netWorkCreate.toDimacs("bla.cnf");
                 if(n >= 16 ){
                     int minFrom = 5;
                     int maxTo = n-5;

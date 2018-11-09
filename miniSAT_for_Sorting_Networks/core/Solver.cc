@@ -1249,7 +1249,8 @@ bool Solver::FL_Check_fast(){
             return false;
         assert(0 == decisionLevel());
     }
-    printf("c fixed %d variables, time was %lf\n", trail.size()-nBefore, cpuTime()-t);
+    if(mpi_rank <= 0)
+        printf("c fixed %d variables, time was %lf\n", trail.size()-nBefore, cpuTime()-t);
     return trail.size() != nBefore;
 }
 
@@ -1724,7 +1725,7 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
         }
     }
     vector<int> nextCube;
-    if(open_cubes[shortestFoundIndex].size() < 10 || bestIndex < 0){
+    if(open_cubes[shortestFoundIndex].size() < 5 || bestIndex < 0){
         nextCube.insert(nextCube.end(), open_cubes[shortestFoundIndex].begin(), open_cubes[shortestFoundIndex].end());
         open_cubes[shortestFoundIndex] = open_cubes.back();
         open_cubes.pop_back();
@@ -1839,6 +1840,7 @@ bool Solver::master_solve(){
 void Solver::slave_solve(vec<Lit> & firstCubes){
     verbosity = 0;
     bool done = false;
+    int solveCalls = 0;
     MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
     while(!done){
         MPI_Status s;
@@ -1857,13 +1859,14 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 vec<Lit> ass;
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
-                if(length < 4)
-                    setConfBudget(1000);
+                if(solveCalls < 4)
+                    setConfBudget(10);
                 else{
                     setConfBudget(opt_numConfls);
                 }
                 printf("c slave %d calling solve\n",mpi_rank );
                 int conflsBefore = conflicts;
+                solveCalls++;
                 lbool ret = solveLimited(ass);
                 printf("c solve done, had %d conflicts\n", conflicts - conflsBefore);
                 if(ret == l_False){
@@ -1928,9 +1931,10 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
 
 lbool Solver::mpi_solve(vec<Lit> & firstCubes){
     // init all stuff
-    initMPIStuff();
+    //initMPIStuff();
     // init parameter
     initParameters();
+    printf("c mpi_solve, rank=%d\n", mpi_rank);
     if(mpi_rank == 0){
         bool succ = master_solve();
         if(succ){
