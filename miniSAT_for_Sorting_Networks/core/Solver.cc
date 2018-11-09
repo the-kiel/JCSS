@@ -105,7 +105,9 @@ Solver::Solver() :
     //
   , solves(0), starts(0), decisions(0), rnd_decisions(0), propagations(0), conflicts(0)
   , dec_vars(0), clauses_literals(0), learnts_literals(0), max_literals(0), tot_literals(0)
-
+  , restart_interval (opt_restartInterval)
+    , maxDB_size(opt_maxDB)
+    , conflsPerCube (opt_numConfls)
   , ok                 (true)
   , cla_inc            (1)
   , var_inc            (1)
@@ -599,9 +601,9 @@ void Solver::reduceDB()
     int middle = learnts.size()/2;
     // Don't delete binary or locked clauses. From the rest, delete clauses from the first half
     // and clauses with activity smaller than 'extra_lim':
-    printf("c first clause: size %d, act %lf\n", ca[learnts[0]].size(), ca[learnts[0]].activity());
+    if(mpi_rank <= 0) printf("c first clause: size %d, act %lf\n", ca[learnts[0]].size(), ca[learnts[0]].activity());
     int n = learnts.size()-1;
-    printf("c last clause: size %d, act %lf\n", ca[learnts[n]].size(), ca[learnts[n]].activity());
+    if(mpi_rank <= 0) printf("c last clause: size %d, act %lf\n", ca[learnts[n]].size(), ca[learnts[n]].activity());
     for (i = j = 0; i < learnts.size(); i++){
         Clause& c = ca[learnts[i]];
         if (c.size() > 2 && !locked(c) && c.canBeDel() && i < middle )
@@ -1089,7 +1091,7 @@ lbool Solver::search(int nof_conflicts)
             if (decisionLevel() == 0 && !simplify())
                 return l_False;
 
-            if(learnts.size() > opt_maxDB)
+            if(learnts.size() > maxDB_size)
                 reduceDB();
             //if (learnts.size()-nAssigns() >= max_learnts)
                 // Reduce the set of learnt clauses:
@@ -1685,6 +1687,43 @@ void Solver::initMPIStuff(){
 
 void Solver::initParameters(){
     printf("c TODO: Adjust parameters! \n");
+    int tmp = mpi_rank;
+    // Restart interval: 1024, 2048 or 4096
+    switch(tmp % 3){
+    case 0:
+        restart_interval = 1024;
+        break;
+    case 1:
+        restart_interval = 2048;
+        break;
+    default:
+        restart_interval = 4096;
+    }
+    tmp /= 3;
+    // conflicts per cube: 25000, 50000, 100000
+    switch(tmp % 3){
+    case 0:
+        conflsPerCube = 25 * 1000;
+        break;
+    case 1:
+        conflsPerCube = 50 * 1000;
+        break;
+    default:
+        conflsPerCube = 100 * 1000;
+    }
+    tmp /= 3;
+    // Max size of clause DB: 100000, 250000, 500000
+    switch(tmp % 3){
+    case 0:
+        maxDB_size = 100 * 1000;
+        break;
+    case 1:
+        maxDB_size = 250 * 1000;
+        break;
+    default:
+        maxDB_size = 500 * 1000;
+    }
+    printf("c configured: myRank %d, restart %d confls %d maxDB %d\n", mpi_rank, restart_interval, conflsPerCube, maxDB_size);
     //assert(false && "TODO");
 
 }
@@ -1744,7 +1783,7 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
     lastCubes[nextSlave] = nextCube;
     printf("c sending cube to %d : ", nextSlave);
     for(int i = 0 ; i < nextCube.size();i++)
-        printf("%d ", nextCube[i]);
+        printf("%d ", (nextCube[i] % 2 == 0) ? nextCube[i]/2 : -nextCube[i]/2);
     printf("\n");
     MPI_Bsend(arr, nextCube.size(), MPI_INT, nextSlave, TAG_NEW_CUBE_FOR_SLAVE, MPI_COMM_WORLD);
 }
@@ -1784,8 +1823,12 @@ bool Solver::master_solve(){
                 foundSAT = true;
                 done = true;
                 guide_to_sat.clear();
-                for(int i = 0 ; i < length ; i++)
-                    guide_to_sat.push(toLit(arr[i]));
+                for(int i = 0 ; i < length ; i++){
+                    Lit l = toLit(arr[i]);
+                    assert(var(l) >= 0);
+                    assert(var(l) < nVars());
+                    guide_to_sat.push(l);
+                }
                 printf("c received partial solution from %d\n", s.MPI_SOURCE);
                 break;
             }
@@ -1807,7 +1850,7 @@ bool Solver::master_solve(){
                 printf("c master received new cube from %d: ", s.MPI_SOURCE);
                 for(int i = 0 ; i < length ; i++){
                     newCube.push_back(arr[i]);
-                    printf("%d ", arr[i]);
+                    printf("%d ", (newCube[i] % 2 == 0) ? newCube[i]/2 : -newCube[i]/2);
                 }
                 printf("\n");
                 open_cubes.push_back(newCube);
@@ -1832,9 +1875,14 @@ bool Solver::master_solve(){
     for(int i = 1 ; i < mpi_num_ranks ; i++)
         MPI_Bsend(NULL, 0, MPI_INT, i, TAG_TERMINATE, MPI_COMM_WORLD);
     MPI_Barrier(MPI_COMM_WORLD);
-
+    printf("c master passed barrier foundSAT=%d\n", foundSAT);
     if(foundSAT){
-        solveLimited(guide_to_sat);
+        usleep(300 * 1000);
+        printf("c master tying to restore solution conflicts here: %d\n \n", conflicts);
+        usleep(300 * 1000);
+        //guide_to_sat.clear();
+        lbool restore = solveLimited(guide_to_sat);
+        printf("c return was true: %d and conflicts %d\n", restore == l_True, conflicts);
         return true;
     }
     return false;
@@ -1865,7 +1913,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 if(solveCalls < 4 || length <= opt_shortCube)
                     setConfBudget(10);
                 else{
-                    setConfBudget(opt_numConfls);
+                    setConfBudget(conflsPerCube);
                 }
                 printf("c slave %d calling solve\n",mpi_rank );
                 int conflsBefore = conflicts;
@@ -1890,7 +1938,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                     int arr[lastTrail.size()];
                     for(int i = 0 ; i < lastTrail.size();i++)
                         arr[i] = toInt(lastTrail[i]);
-                    MPI_Bsend(arr, lastTrail.size() + conflict.size()+2, MPI_INT, 0, TAG_SAT_ANSWER, MPI_COMM_WORLD);
+                    MPI_Bsend(arr, lastTrail.size() , MPI_INT, 0, TAG_SAT_ANSWER, MPI_COMM_WORLD);
                 }
                 else{
                     printf("c cube not solved, sending answer to master! \n");
@@ -1937,17 +1985,19 @@ lbool Solver::mpi_solve(vec<Lit> & firstCubes){
     //initMPIStuff();
     // init parameter
     initParameters();
+    lbool ret = l_False;
     printf("c mpi_solve, rank=%d\n", mpi_rank);
     if(mpi_rank == 0){
         bool succ = master_solve();
         if(succ){
-            return l_True;
+            ret = l_True;
         }
     }
     else{
         slave_solve(firstCubes);
     }
-    return l_False;
+    MPI_Barrier(MPI_COMM_WORLD);
+    return ret;
 }
 
 lbool Solver::DFS_Solve(vec<Lit> & firstCubes){
@@ -2131,7 +2181,7 @@ lbool Solver::solve_()
         if(maxConfls > 4000){
             maxConfls = 4000;
         }
-        status = search(opt_restartInterval);
+        status = search(restart_interval);
         if (!withinBudget()) break;
         curr_restarts++;
         if(conflicts > conflsNextCheck && status == l_Undef && opt_subsumptionTests){

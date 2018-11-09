@@ -198,6 +198,9 @@ public:
     void sendNextJob(std::vector<std::vector<int> > & open_cubes, std::vector<int> & idle_slave_indices, std::map<int, std::vector<int> > & lastCubes);
     bool failedCube(int * arr, int n, int sender);
     vec<Lit> lastTrail;
+    int restart_interval;
+    int maxDB_size;
+    int conflsPerCube;
 protected:
 
     // Helper structures:

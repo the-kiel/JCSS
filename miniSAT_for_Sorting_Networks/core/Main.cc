@@ -2337,7 +2337,10 @@ int main(int argc, char **argv) {
             printStats(netWorkCreate);
         }
         lbool ret = l_Undef;
-
+        if(opt_mpi){
+            MPI_Barrier(MPI_COMM_WORLD);
+            MPI_Finalize();
+        }
 
 #ifdef NDEBUG
         exit(ret == l_True ? 10 : ret == l_False ? 20 : 0);     // (faster than "return", which will invoke the destructor for 'Solver')
