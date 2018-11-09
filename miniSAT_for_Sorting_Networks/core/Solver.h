@@ -363,10 +363,11 @@ inline void Solver::claBumpActivity (Clause& c) {
         if ( (c.activity() += cla_inc) > 1e20 ) {
             // Rescale:
             bool written = false;
-            printf("Rescaling clause activities\n");
+            if(mpi_rank <= 0)
+                printf("Rescaling clause activities\n");
             for (int i = 0; i < learnts.size(); i++){
                 ca[learnts[i]].activity() *= 1e-20;
-                if(ca[learnts[i]].activity() == 0.0 && !written){
+                if(ca[learnts[i]].activity() == 0.0 && !written && mpi_rank <= 0){
                     printf("Act dropped to 0.0\n");
                     written = true;
                 }

@@ -2325,15 +2325,17 @@ int main(int argc, char **argv) {
                 printNetwork(netWorkCreate, n, d, compVarsInCreatedNW);
             }
         }
-        printf("time was %f s\n", cpuTime() - initial_time);
+        if(myMPI_rank <= 0){
+            printf("time was %f s\n", cpuTime() - initial_time);
 
-        printf("Time spent in network creation: %lf\n", overAllTimeForNetworkCreation);
-        printf("==============================================\n");
-        printf("Comparator stats: \n");
-        printStats(netWorksCompare);
-        printf("==============================================\n");
-        printf("Network creation stats: \n");
-        printStats(netWorkCreate);
+            printf("Time spent in network creation: %lf\n", overAllTimeForNetworkCreation);
+            printf("==============================================\n");
+            printf("Comparator stats: \n");
+            printStats(netWorksCompare);
+            printf("==============================================\n");
+            printf("Network creation stats: \n");
+            printStats(netWorkCreate);
+        }
         lbool ret = l_Undef;
 
 

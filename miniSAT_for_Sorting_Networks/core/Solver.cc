@@ -65,6 +65,8 @@ static IntOption     opt_numConfls      (_cat, "numConfls",      "Number of conf
 static IntOption     opt_maxDB          (_cat, "maxDB",      "Size of learnt clause database before clean", 300000, IntRange(1, INT32_MAX));
 
 static BoolOption    opt_subsumptionTests       (_cat, "subTests",        "Use subsumption tests on core learnt clauses", false);
+
+static IntOption     opt_shortCube     (_cat, "shortCube",      "Cubes with this size will be considered small", 6, IntRange(0, INT32_MAX));
 //=================================================================================================
 // Constructor/Destructor:
 
@@ -612,7 +614,8 @@ void Solver::reduceDB()
         }
     }
     learnts.shrink(i - j);
-    printf("c reduce DB: %d -> %d clauses\n", i, j);
+    if(mpi_rank <= 0)
+        printf("c reduce DB: %d -> %d clauses\n", i, j);
     checkGarbage();
 }
 
@@ -1725,7 +1728,7 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
         }
     }
     vector<int> nextCube;
-    if(open_cubes[shortestFoundIndex].size() < 5 || bestIndex < 0){
+    if(open_cubes[shortestFoundIndex].size() <=opt_shortCube  || bestIndex < 0){
         nextCube.insert(nextCube.end(), open_cubes[shortestFoundIndex].begin(), open_cubes[shortestFoundIndex].end());
         open_cubes[shortestFoundIndex] = open_cubes.back();
         open_cubes.pop_back();
@@ -1859,7 +1862,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 vec<Lit> ass;
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
-                if(solveCalls < 4)
+                if(solveCalls < 4 || length <= opt_shortCube)
                     setConfBudget(10);
                 else{
                     setConfBudget(opt_numConfls);
