@@ -1971,7 +1971,20 @@ void testTheseVars(Solver & s, int index, vector<int> & testVars, int numConfls,
     }
 }
 
-
+void addTestLiterals_oneIn(int layer, int n, int minFrom, int maxTo, triVarMap &compVarsInCreatedNW){
+    for(int i = 0 ; i < n ; i++){
+        for(int j = n-1 ; j > i  ; j--){
+            int from = i;
+            int to = j;
+            if((from >= minFrom && from <= maxTo ) || (to >= minFrom && to <= maxTo)){
+                if(compVarsInCreatedNW.count(comparator(layer, from, to))){
+                    if(myMPI_rank <= 0) printf("c layer %d : %d -> %d varIndex is %d\n", layer, from, to, compVarsInCreatedNW[comparator(layer, from,to)]);
+                    firstCubes.push(mkLit(compVarsInCreatedNW[comparator(layer, from, to)]));
+                }
+            }
+        }
+    }
+}
 
 void addTestLiterals(int layer, int minFrom, int maxTo, int maxLength, triVarMap &compVarsInCreatedNW){
     for(int i = minFrom ; i < maxTo ; i++){
@@ -2212,6 +2225,8 @@ int main(int argc, char **argv) {
                     addTestLiterals(d-2, minFrom, maxTo, 3,compVarsInCreatedNW);
                     addTestLiterals(d-1, minFrom, maxTo, 1,compVarsInCreatedNW);
                     addTestLiterals(d-3, minFrom, maxTo, 8,compVarsInCreatedNW);
+                    addTestLiterals_oneIn(d-2, n, minFrom, maxTo, compVarsInCreatedNW);
+                    addTestLiterals_oneIn(d-3, n, minFrom, maxTo, compVarsInCreatedNW);
                     /*int nStart = n/2 - 3;
                     for(int i = 0 ; i < 4 ; i++){
                         for(int k = 1 ; k <= 3 ; k++){

@@ -1976,6 +1976,8 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 printf("c received cube of size %d\n", length);
                 MPI_Recv(arr, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
                 vec<Lit> ass;
+
+                bool shortCube = solveCalls < 4 || length <= opt_shortCube;
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
                 if(solveCalls < 4 || length <= opt_shortCube)
@@ -1986,7 +1988,18 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 //printf("c slave %d calling solve\n",mpi_rank );
                 int conflsBefore = conflicts;
                 solveCalls++;
-                lbool ret = solveLimited(ass);
+                lbool ret ;
+                if(shortCube)
+                    ret  = solveLimited(ass);
+                else{
+                    setConfBudget(2000);
+                    ret = solveLimited(ass);
+                    if(ret == l_Undef){
+                        FL_Check_With_Assumptions(ass);
+                        setConfBudget(conflsPerCube);
+                        ret = solveLimited(ass);
+                    }
+                }
 
                 if(ret == l_False){
                     printf("c cube failed after %d conflicts\n", conflicts - conflsBefore);
