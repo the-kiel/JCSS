@@ -38,6 +38,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #define TAG_TERMINATE               5
 #define TAG_NEW_CUBE_FOR_MASTER     6
 #define TAG_SHARED_FAILED_CUBE      7
+#define TAG_STEAL_REQUEST           8
 
 namespace Minisat {
 
@@ -206,6 +207,7 @@ public:
     std::set<int> master_shared_units;
     bool share_failed_cube(vec<Lit> & ps);
     bool importFailedCubes();
+    bool stealRequestPending;
 protected:
 
     // Helper structures:

@@ -108,6 +108,7 @@ Solver::Solver() :
   , restart_interval (opt_restartInterval)
     , maxDB_size(opt_maxDB)
     , conflsPerCube (opt_numConfls)
+  , stealRequestPending(false)
   , ok                 (true)
   , cla_inc            (1)
   , var_inc            (1)
@@ -1570,9 +1571,9 @@ bool Solver::FL_Check_With_Assumptions(vec<Lit> & ass){
         if(check_lit_with_assumptions(~mkLit(i), seenHere, ass))
             return false;
     }
-    printf("c conditional FL check done! \n");
+    //printf("c conditional FL check done! \n");
     restoreTrail(ass);
-    printf("c trail size %d -> %d in time %lf\n", tsBefore, trail.size(), cpuTime()-t);
+    printf("c solver %d trail size %d -> %d in time %lf\n", mpi_rank, tsBefore, trail.size(), cpuTime()-t);
     cancelUntil(0);
     return true;
 
@@ -1700,28 +1701,28 @@ void Solver::initParameters(){
         restart_interval = 4096;
     }
     tmp /= 3;
-    // conflicts per cube: 25000, 50000, 100000
+    // conflicts per cube: 50000, 100000, 200000
     switch(tmp % 3){
     case 0:
-        conflsPerCube = 25 * 1000;
-        break;
-    case 1:
         conflsPerCube = 50 * 1000;
         break;
-    default:
+    case 1:
         conflsPerCube = 100 * 1000;
+        break;
+    default:
+        conflsPerCube = 250 * 1000;
     }
     tmp /= 3;
-    // Max size of clause DB: 100000, 250000, 500000
+    // Max size of clause DB: 200000, 500000, 1000000
     switch(tmp % 3){
     case 0:
-        maxDB_size = 100 * 1000;
+        maxDB_size = 200 * 1000;
         break;
     case 1:
-        maxDB_size = 250 * 1000;
+        maxDB_size = 500 * 1000;
         break;
     default:
-        maxDB_size = 500 * 1000;
+        maxDB_size = 1000 * 1000;
     }
     printf("c configured: myRank %d, restart %d confls %d maxDB %d\n", mpi_rank, restart_interval, conflsPerCube, maxDB_size);
     //assert(false && "TODO");
@@ -1751,6 +1752,13 @@ bool Solver::importFailedCubes(){
 
         }
         else{
+            MPI_Iprobe(MPI_ANY_SOURCE, TAG_STEAL_REQUEST, MPI_COMM_WORLD, &received, &s);
+            if(received){
+                printf("c slave %d received steal request! \n", mpi_rank);
+                stealRequestPending = true;
+                int dummy;
+                MPI_Recv(&dummy, 0, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+            }
             done = true;
         }
     }
@@ -1815,7 +1823,7 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
     idle_slave_indices.pop_back();
     // Get the next job:
     int shortestFoundIndex = 0;
-    int longestPrefix = 0;
+    int longestPrefix = -1;
     int bestIndex = -1;
 
     for(int i = 0 ; i < open_cubes.size();i++){
@@ -1826,7 +1834,7 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
             vector<int> & lastPref = lastCubes[nextSlave];
             for(int j = 0 ; j < lastPref.size() && j < open_cubes[i].size() && open_cubes[i][j] == lastPref[j] ; j++)
                 sz++;
-            if(sz > longestPrefix){
+            if(sz > longestPrefix || (sz == longestPrefix && open_cubes[i].size() < open_cubes[bestIndex].size())){
                 longestPrefix = sz;
                 bestIndex = i;
             }
@@ -1865,10 +1873,19 @@ bool Solver::master_solve(){
     map<int, vector<int> > lastCube;
     bool done = false;
     bool foundSAT = false;
+    double time_last_steal_request = MPI_Wtime();
     while(!done){
         if(open_cubes.size() > 0 && idle_slave_indices.size() > 0){
             // Pick a solver and send next cube:
             sendNextJob(open_cubes, idle_slave_indices, lastCube);
+        }
+        if(open_cubes.size() < mpi_num_ranks && MPI_Wtime() > time_last_steal_request + 5){
+            printf("c master: have only %d open jobs, sending steal request! \n", open_cubes.size());
+            for(int i = 1 ; i < mpi_num_ranks ; i++){
+                MPI_Bsend(NULL, 0, MPI_INT, i,TAG_STEAL_REQUEST , MPI_COMM_WORLD);
+
+            }
+            time_last_steal_request = MPI_Wtime();
         }
         MPI_Status s;
         int received;
@@ -1980,7 +1997,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 bool shortCube = solveCalls < 4 || length <= opt_shortCube;
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
-                if(solveCalls < 4 || length <= opt_shortCube)
+                if(length <= opt_shortCube)
                     setConfBudget(10);
                 else{
                     setConfBudget(conflsPerCube);
@@ -2002,7 +2019,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 }
 
                 if(ret == l_False){
-                    printf("c cube failed after %d conflicts\n", conflicts - conflsBefore);
+                    printf("c solver %d cube failed after %d conflicts\n", mpi_rank, conflicts - conflsBefore);
                     int arr[2 + conflict.size() + ass.size()];
                     arr[0] = ass.size();
                     arr[1] = conflict.size();
@@ -2028,6 +2045,13 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                         next = getNextBranchLit(ass);
                     if(next == lit_Undef){
                         // Send this cube back to the solver
+                        printf("c solver %d could not find branching literal??? \n", mpi_rank);
+                        int arr[length];
+                        for(int i = 0 ; i < ass.size();i++){
+                            arr[i] = toInt(ass[i]);
+                            MPI_Bsend(arr, length, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
+                            MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
+                        }
                     }
                     else{
                         int arr1[length+1];
@@ -2035,8 +2059,8 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                         for(int i = 0 ; i < ass.size();i++){
                             arr1[i] = arr2[i] = toInt(ass[i]);
                         }
-                        arr1[length] = toInt(next);
-                        arr2[length] = toInt(~next);
+                        arr1[length] = toInt(mkLit(var(next)));
+                        arr2[length] = toInt(~mkLit(var(next)));
                         MPI_Bsend(arr1, length+1, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
                         MPI_Bsend(arr2, length+1, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
                         MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
@@ -2050,6 +2074,13 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
             case TAG_SHARED_FAILED_CUBE:
                 importFailedCubes();
                 break;
+            case TAG_STEAL_REQUEST:
+            {
+                int dummy;
+                stealRequestPending = true;
+                MPI_Recv(&dummy, 0, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+                break;
+            }
             default:
                 printf("c received weird tag %d\n", s.MPI_TAG);
                 break;
@@ -2296,6 +2327,12 @@ lbool Solver::solve_()
             conflsNextCheck = conflicts + delay_Checks;
 
             reduceDB();
+        }
+        if(stealRequestPending){
+            stealRequestPending = false;
+            if(status == l_Undef){
+                return status;
+            }
         }
     }
 

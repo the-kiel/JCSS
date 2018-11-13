@@ -2220,7 +2220,7 @@ int main(int argc, char **argv) {
                 if(myMPI_rank <= 0) netWorkCreate.toDimacs("bla.cnf");
                 if(n >= 16 ){
                     int minFrom = 5;
-                    int maxTo = n-5;
+                    int maxTo = n-6;
                     // Last layer:
                     addTestLiterals(d-2, minFrom, maxTo, 3,compVarsInCreatedNW);
                     addTestLiterals(d-1, minFrom, maxTo, 1,compVarsInCreatedNW);
