@@ -1477,6 +1477,213 @@ void Solver::checkClausesUnterAssumptions(vec<Lit> & ass, set<vector<int> > & al
     cancelUntil(0);
 }
 
+int Solver::countNumProps(Lit l, vec<Lit> & ass){
+    for(int i = 0 ; i < ass.size();i++){
+        if(value(ass[i]) == l_False){
+            //printf("c got UNSAT during counting propagations!  \n");
+            return -1;
+        }
+        else if(value(ass[i]) == l_Undef){
+            newDecisionLevel();
+            uncheckedEnqueue(ass[i]);
+            CRef confl = propagate();
+            if(confl != CRef_Undef){
+                //printf("c got confl while propagating trail! \n");
+                return -1;
+            }
+        }
+    }
+    if(value(l) == l_Undef){
+        int dlBefore = decisionLevel();
+        newDecisionLevel();
+        uncheckedEnqueue(l);
+        CRef confl = propagate();
+        if(confl != CRef_Undef){
+            printf("c found literal which fails??? \n");
+            cancelUntil(dlBefore);
+            return 1<<24;
+        }
+        else{
+            int ret = trail.size();
+            cancelUntil(dlBefore);
+            ret -=  (decisionLevel() > 0 ? trail_lim[0] : trail.size());
+            return ret;
+        }
+    }
+    else
+        return 0;
+}
+
+void Solver::getAllFailedLiterals(vec<Lit> & ass, vec<Lit> & chooseFrom){
+    int clBefore = learnts.size();
+    for(int i = 0 ; i < chooseFrom.size();i++){
+        cancelUntil(0);
+        restoreTrail(ass);
+        if(value(chooseFrom[i]) == l_Undef){
+            ass.push(chooseFrom[i]);
+            FL_Check_With_Assumptions(ass);
+            ass.pop();
+        }
+        cancelUntil(0);
+        restoreTrail(ass);
+        if(value(chooseFrom[i]) == l_Undef){
+            ass.push(~chooseFrom[i]);
+            FL_Check_With_Assumptions(ass);
+            ass.pop();
+        }
+    }
+    cancelUntil(0);
+    printf("c got failed literals for all possible literals, clauses %d -> %d\n", clBefore, learnts.size());
+}
+
+Lit Solver::getNextBranchLit_expensive(vec<Lit> & ass, vec<Lit> & chooseFrom){
+    int assSizeBefore = ass.size();
+    getAllFailedLiterals(ass, chooseFrom);
+    assert(ass.size() == assSizeBefore);
+    getAllFailedLiterals(ass, chooseFrom);
+    assert(ass.size() == assSizeBefore);
+    map<int, int> propsByLiteral;
+    map<int, int> propsByVar;
+    for(int i = 0 ; i < chooseFrom.size();i++){
+        int resultHere = countNumProps(chooseFrom[i], ass);
+        propsByLiteral[toInt(chooseFrom[i])] = resultHere;
+        propsByVar[var(chooseFrom[i])] = resultHere;
+        resultHere = countNumProps(~chooseFrom[i], ass);
+        propsByLiteral[toInt(~chooseFrom[i])] = resultHere;
+        propsByVar[var(chooseFrom[i])] += resultHere;
+    }
+    cancelUntil(0);
+    int best = -1;
+    Lit ret = lit_Undef;
+    for(map<int, int>::iterator it = propsByVar.begin() ; it != propsByVar.end();it++){
+        int v = it->first;
+        printf("c solver %d expensive branching: var %d : %d (%d and %d) propagations\n", mpi_rank, v, it->second, propsByLiteral[toInt(mkLit(v))], propsByLiteral[toInt(~mkLit(v))]);
+        if(it->second > best){
+            best = it->second;
+            ret = propsByLiteral[toInt(mkLit(v))] >  propsByLiteral[toInt(~mkLit(v))] ? mkLit(v) : ~mkLit(v);
+        }
+    }
+    return ret;
+}
+
+Lit Solver::checkTuplePairs(vec<Lit> & ass, vec<Lit> & chooseFrom){
+    vector<pair<int, pair<int, int> > > ratedResults;
+    int best = -1;
+    for(int i = 0 ; i < chooseFrom.size();i++){
+        for(int j = i+1 ; j < chooseFrom.size();j++){
+            vector<int> results;
+            bool hadFail = false;
+            for(int k = 0 ; k < 4 ; k++){
+                cancelUntil(0);
+                Lit l1 = k & 1 ? chooseFrom[i] : ~chooseFrom[i];
+                Lit l2 = k & 2 ? chooseFrom[j] : ~chooseFrom[j];
+                ass.push(l1);
+                int ret = countNumProps(l2, ass);
+                ass.pop();
+                if(ret < 0)
+                    hadFail = true;
+                /*if(ret == 1<<24){
+                    printf("c this pair fails by unit propagation --- failed literal :) ");
+                    printLit(l1);
+                    printLit(l2);
+                    printf("\n");
+                }*/
+                if(ret >= 0 && ret < (1<<24))
+                    results.push_back(ret);
+            }
+            if(results.size() == 4){
+                std::sort(results.begin(), results.end());
+                int eval = 0;
+                int factor = 8;
+                eval = 2*results[0] + results[1];
+                /*
+                for(int k = 0 ; k < results.size();k++){
+                    eval += factor * results[k];
+                    factor /= 2;
+                }*/
+                if(eval > best){
+                    best = eval;
+                    printf("c new best ranking %d ", best);
+                    for(int k = 0 ; k < results.size();k++)
+                        printf("%d ", results[k]);
+                    printf("\n");
+                }
+                ratedResults.push_back(make_pair(eval, make_pair(toInt(chooseFrom[i]), toInt(chooseFrom[j]))));
+            }
+        }
+    }
+
+    std::sort(ratedResults.begin(), ratedResults.end());
+    for(int i = 0 ; i < 20 ; i++){
+        int index = ratedResults.size()-1-i;
+        if(index < 0)
+            break;
+        printf("c rated: index %d ranking %d literals ", index, ratedResults[index].first);
+        printIntLit(ratedResults[index].second.first);
+        printIntLit(ratedResults[index].second.second);
+        printf("\n");
+    }
+    cancelUntil(0);
+    if(ratedResults.size() > 0)
+        return toLit(ratedResults[ratedResults.size()-1].second.first);
+    return lit_Undef;
+}
+
+
+Lit Solver::getNextLitWithMostPropagations(vec<Lit> & ass, vec<Lit> & chooseFrom){
+    assert(0 == decisionLevel());
+    int best = 0;
+    int worst = 1<<24;
+    Lit ret = lit_Undef;
+    for(int i = 0 ; i < chooseFrom.size();i++){
+        int here = countNumProps(chooseFrom[i], ass);
+        if(here < worst)
+            worst = here;
+        if(here > best){
+            best = here;
+            ret = chooseFrom[i];
+        }
+        here = countNumProps(~chooseFrom[i], ass);
+        if(here < worst)
+            worst = here;
+        if(here > best){
+            best = here;
+            ret = ~chooseFrom[i];
+        }
+    }
+    cancelUntil(0);
+    printf("c found branch literal, best=%d, worst %d\n", best, worst);
+    return ret;
+}
+
+bool Solver::analyzeAndBacktrack(CRef confl){
+    int backtrack_level;
+    vec<Lit> learnt_clause;
+    analyze(confl, learnt_clause, backtrack_level);
+    cancelUntil(backtrack_level);
+    if (learnt_clause.size() == 1){
+        uncheckedEnqueue(learnt_clause[0]);
+        confl = propagate();
+        if(confl != CRef_Undef){
+            printf("c got UNSAT??? \n");
+            ok = false;
+            return true;
+        }
+    }else{
+        CRef cr = ca.alloc(learnt_clause, true);
+        learnts.push(cr);
+        attachClause(cr);
+        claBumpActivity(ca[cr]);
+
+        confl = propagate();
+        if(confl != CRef_Undef){
+            printf("c repeated propagation, backtrack! \n");
+            return analyzeAndBacktrack(confl);
+        }
+    }
+    return false;
+}
+
 bool Solver::check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec<Lit> & ass){
     for(int i = 0 ; i < ass.size();i++){
         if(value(ass[i]) == l_False){
@@ -1508,6 +1715,8 @@ bool Solver::check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec
             cancelUntil(dlBefore);
         }
         else{
+            analyzeAndBacktrack(confl);
+            /*
             int backtrack_level;
             vec<Lit> learnt_clause;
             analyze(confl, learnt_clause, backtrack_level);
@@ -1550,7 +1759,7 @@ bool Solver::check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec
                     printf("c got UNSAT after propagating this clause? this should not happen! \n");
                     return true;
                 }
-            }
+            }*/
         }
     }
     return false;
@@ -1767,6 +1976,8 @@ bool Solver::importFailedCubes(){
 
 bool Solver::share_failed_cube(vec<Lit> & ps){
     verbosity = 0;
+    printf("c share_failed called! \n");
+    setConfBudget(2 * ps.size());
     lbool ret = solveLimited(ps);
     assert(ret == l_False);
     if(conflict.size() <= 1){
@@ -1794,6 +2005,7 @@ bool Solver::share_failed_cube(vec<Lit> & ps){
             MPI_Bsend(arr, conflict.size(), MPI_INT, i,TAG_SHARED_FAILED_CUBE , MPI_COMM_WORLD);
         }
     }
+    printf("c share_failed done! \n");
     return true;
 }
 
@@ -1803,11 +2015,21 @@ bool Solver::failedCube(int * arr, int n, int sender){
     printf("c received failed cube of size %d, conflict size %d\n", cubeLength, conflLength);
     vec<Lit> failedCube;
     vec<Lit> conflict;
+
+
     for(int i = 0 ; i < cubeLength ; i++)
         failedCube.push(toLit(arr[2+i]));
     for(int i = 0 ; i < conflLength ; i++){
         conflict.push(toLit(arr[2+cubeLength+i]));
     }
+    printf("c received failed cube: ");
+    for(int i = 0 ; i < failedCube.size();i++)
+        printLit(failedCube[i]);
+    printf("\n");
+    printf("c conflict clause: ");
+    for(int i = 0 ; i < conflict.size();i++)
+        printLit(conflict[i]);
+    printf("\n");
     addClause(conflict);
     share_failed_cube(failedCube);
     vec<Lit> failedCube2;
@@ -1879,7 +2101,7 @@ bool Solver::master_solve(){
             // Pick a solver and send next cube:
             sendNextJob(open_cubes, idle_slave_indices, lastCube);
         }
-        if(open_cubes.size() < mpi_num_ranks && MPI_Wtime() > time_last_steal_request + 5){
+        if(false && open_cubes.size() < mpi_num_ranks && MPI_Wtime() > time_last_steal_request + 5){
             printf("c master: have only %d open jobs, sending steal request! \n", open_cubes.size());
             for(int i = 1 ; i < mpi_num_ranks ; i++){
                 MPI_Bsend(NULL, 0, MPI_INT, i,TAG_STEAL_REQUEST , MPI_COMM_WORLD);
@@ -1990,10 +2212,13 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
 
                 MPI_Get_count(&s, MPI_INT, &length);
                 int  arr[length];
-                printf("c received cube of size %d\n", length);
+                printf("c solver %d received cube of size %d ", mpi_rank, length);
                 MPI_Recv(arr, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
                 vec<Lit> ass;
-
+                for(int i = 0 ; i < length ; i++){
+                    printIntLit(arr[i]);
+                }
+                printf("\n");
                 bool shortCube = solveCalls < 4 || length <= opt_shortCube;
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
@@ -2027,6 +2252,23 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                         arr[2+i] = toInt(ass[i]);
                     for(int i = 0 ; i < conflict.size();i++)
                         arr[2+ass.size()+i] = toInt(conflict[i]);
+                    printf("c solver %d cube: ", mpi_rank);
+                    for(int i = 0 ; i < ass.size();i++)
+                        printLit(ass[i]);
+                    printf("\n");
+                    printf("c solver %d assumptions: ", mpi_rank);
+                    for(int i = 0 ; i < assumptions.size();i++){
+                        printLit(assumptions[i]);
+                    }
+                    printf("\n");
+                    printf("c solver %d conflict clause: ", mpi_rank);
+                    for(int i = 0 ; i < conflict.size();i++)
+                        printLit(conflict[i]);
+                    printf("\n");
+                    printf("c solver %d array received: ", mpi_rank);
+                    for(int i = 0 ; i < length ; i++)
+                        printIntLit(arr[i]);
+                    printf("\n");
                     MPI_Bsend(arr, ass.size() + conflict.size()+2, MPI_INT, 0, TAG_UNSAT_ANSWER, MPI_COMM_WORLD);
                     MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
 
@@ -2041,17 +2283,25 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 else{
                     printf("c cube not solved, sending answer to master! \n");
                     Lit next = getNextBranchLitFromList(ass, firstCubes);
+                    /*if(ass.size() <= 3)
+                        next = checkTuplePairs( ass, firstCubes);
+                        //next = getNextBranchLit_expensive(ass, firstCubes);
+                    else
+                        next = getNextLitWithMostPropagations(ass, firstCubes); //getNextBranchLitFromList(ass, firstCubes);*/
+
+                    assert(0 == decisionLevel());
                     if(next == lit_Undef)
                         next = getNextBranchLit(ass);
+                    assert(0 == decisionLevel());
                     if(next == lit_Undef){
                         // Send this cube back to the solver
                         printf("c solver %d could not find branching literal??? \n", mpi_rank);
-                        int arr[length];
-                        for(int i = 0 ; i < ass.size();i++){
-                            arr[i] = toInt(ass[i]);
-                            MPI_Bsend(arr, length, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
-                            MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
-                        }
+                        int arr2[length];
+                        for(int i = 0 ; i < ass.size();i++)
+                            arr2[i] = toInt(ass[i]);
+                        MPI_Bsend(arr2, length, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
+                        MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
+
                     }
                     else{
                         int arr1[length+1];
@@ -2059,8 +2309,8 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                         for(int i = 0 ; i < ass.size();i++){
                             arr1[i] = arr2[i] = toInt(ass[i]);
                         }
-                        arr1[length] = toInt(mkLit(var(next)));
-                        arr2[length] = toInt(~mkLit(var(next)));
+                        arr1[length] = toInt(next);
+                        arr2[length] = toInt(~next);
                         MPI_Bsend(arr1, length+1, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
                         MPI_Bsend(arr2, length+1, MPI_INT, 0, TAG_NEW_CUBE_FOR_MASTER, MPI_COMM_WORLD);
                         MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
@@ -2482,4 +2732,12 @@ void Solver::garbageCollect()
         printf("|  Garbage collection:   %12d bytes => %12d bytes             |\n", 
                ca.size()*ClauseAllocator::Unit_Size, to.size()*ClauseAllocator::Unit_Size);
     to.moveTo(ca);
+}
+void Solver::printIntLit(int l){
+    printf("%d ", (l % 2 == 0) ? l/2 : -l/2);
+}
+
+void Solver::printLit(Lit l){
+    int tmp = toInt(l);
+    printIntLit(tmp);
 }

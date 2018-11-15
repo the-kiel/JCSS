@@ -186,6 +186,9 @@ public:
     bool FL_Check_fast();
     bool checkLitFast(Lit l, std::vector<bool> & seenHere);
     bool check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec<Lit> & ass);
+    bool analyzeAndBacktrack(CRef confl);
+    int countNumProps(Lit l, vec<Lit> & ass);
+    Lit getNextLitWithMostPropagations(vec<Lit> & ass, vec<Lit> & chooseFrom);
     bool FL_Check_With_Assumptions(vec<Lit> & ass);
     bool    restoreTrail(vec<Lit> & ass);
     void updateProgress(int length, std::vector<int> & progress);
@@ -208,6 +211,14 @@ public:
     bool share_failed_cube(vec<Lit> & ps);
     bool importFailedCubes();
     bool stealRequestPending;
+
+    void printIntLit(int l);
+
+    void printLit(Lit l);
+
+    void getAllFailedLiterals(vec<Lit> & ass, vec<Lit> & chooseFrom);
+    Lit getNextBranchLit_expensive(vec<Lit> & ass, vec<Lit> & chooseFrom);
+    Lit checkTuplePairs(vec<Lit> & ass, vec<Lit> & chooseFrom);
 protected:
 
     // Helper structures:

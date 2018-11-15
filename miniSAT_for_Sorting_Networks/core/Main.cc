@@ -1999,6 +1999,19 @@ void addTestLiterals(int layer, int minFrom, int maxTo, int maxLength, triVarMap
     }
 }
 
+void addTest_range(Solver & s, int layer, int n, int channel, map<comparator, Var> &rangeVars, triVarMap &compVarsInCreatedNW){
+    // Add variable: one up from channel
+    if(rangeVars.count(comparator(layer, 0, channel)) == 0)
+        addOneFromToRange(s, layer, 0, channel, compVarsInCreatedNW, rangeVars);
+    if(rangeVars.count(comparator(layer, channel, n-1)) == 0)
+        addOneFromToRange(s, layer, channel, n-1, compVarsInCreatedNW, rangeVars);
+    if(myMPI_rank <= 0) printf("c rangeVar layer %d range %d - %d : %d\n", layer, 0, channel, rangeVars[comparator(layer, 0, channel)]);
+    if(myMPI_rank <= 0) printf("c rangeVar layer %d range %d - %d : %d\n", layer, channel, n-1, rangeVars[comparator(layer, channel, n-1)]);
+    firstCubes.push(mkLit(rangeVars[comparator(layer, 0, channel)]));
+    firstCubes.push(mkLit(rangeVars[comparator(layer, channel, n-1)]));
+
+}
+
 void testLastLayerStuff(Solver & s, int n, int d,triVarMap &compVarsInCreatedNW,
                         map<pair<int, int>, Var> &used, Var &T, Var &F, triVarMap &intVars,
                         triVarMap &rangeVars){
@@ -2165,6 +2178,8 @@ int main(int argc, char **argv) {
         Solver netWorkCreate;
         solver = &netWorkCreate;
         netWorkCreate.verbosity = verb;
+        netWorkCreate.mpi_rank = myMPI_rank;
+        netWorkCreate.mpi_num_ranks = num_mpi_ranks;
         map<comparator, Var> rangeVars;
         map<comparator, Var> compVarsInCreatedNW;
         map<pair<int, int>, Var> used;
@@ -2225,8 +2240,16 @@ int main(int argc, char **argv) {
                     addTestLiterals(d-2, minFrom, maxTo, 3,compVarsInCreatedNW);
                     addTestLiterals(d-1, minFrom, maxTo, 1,compVarsInCreatedNW);
                     addTestLiterals(d-3, minFrom, maxTo, 8,compVarsInCreatedNW);
-                    addTestLiterals_oneIn(d-2, n, minFrom, maxTo, compVarsInCreatedNW);
-                    addTestLiterals_oneIn(d-3, n, minFrom, maxTo, compVarsInCreatedNW);
+                    for(int i = minFrom ; i <= maxTo ; i++)
+                        addTest_range(netWorkCreate, d-1, n, i, rangeVars, compVarsInCreatedNW);
+                    for(int i = minFrom ; i <= maxTo ; i++)
+                        addTest_range(netWorkCreate, d-2, n, i, rangeVars, compVarsInCreatedNW);
+                    for(int i = minFrom ; i <= maxTo ; i++)
+                        addTest_range(netWorkCreate, d-3, n, i, rangeVars, compVarsInCreatedNW);
+                    // TODO: Add some noneUp/noneDown???
+
+                    //addTestLiterals_oneIn(d-2, n, minFrom, maxTo, compVarsInCreatedNW);
+                    //addTestLiterals_oneIn(d-3, n, minFrom, maxTo, compVarsInCreatedNW);
                     /*int nStart = n/2 - 3;
                     for(int i = 0 ; i < 4 ; i++){
                         for(int k = 1 ; k <= 3 ; k++){
