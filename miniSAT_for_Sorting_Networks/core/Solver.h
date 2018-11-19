@@ -211,7 +211,7 @@ public:
     bool share_failed_cube(vec<Lit> & ps);
     bool importFailedCubes();
     bool stealRequestPending;
-
+    bool terminateRun;
     void printIntLit(int l);
 
     void printLit(Lit l);
@@ -219,6 +219,11 @@ public:
     void getAllFailedLiterals(vec<Lit> & ass, vec<Lit> & chooseFrom);
     Lit getNextBranchLit_expensive(vec<Lit> & ass, vec<Lit> & chooseFrom);
     Lit checkTuplePairs(vec<Lit> & ass, vec<Lit> & chooseFrom);
+    int getNumFixedVars();
+    lbool value_at_root_level(Var v);
+    vec<Lit> lastSolutionDLs;
+    bool countSolutions;
+    void readRemainingMessages();
 protected:
 
     // Helper structures:

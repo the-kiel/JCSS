@@ -1298,22 +1298,29 @@ void addInputImprovedEncoding(Solver &s, vector<bool> &newInput, int n, int d, t
             tailingOnes++;
         }
     }
+//    if(myMPI_rank <= 0){
+//        printf("c adding input with %d leading zeros, and %d tailing ones! \n", leadingZeros, tailingOnes);
+//    }
+
     /*if(zeros == 9){
         printf("c input %d zeros %d ones %d leading %d trailing\n", zeros, n-zeros, leadingZeros, tailingOnes);
     }*/
     // Create new internal variables
-    for (int i = 0; i < d - 1; i++) {
-        for (int j = 0; j < n; j++) {
-            if (j < leadingZeros) {
-                newInternalVars[make_pair(i, j)] = F;
-                intVars.insert(make_pair(comparator(calls, i, j), F));
-            } else if (j >= n - tailingOnes) {
-                newInternalVars[make_pair(i, j)] = T;
-                intVars.insert(make_pair(comparator(calls, i, j), T));
-            } else {
-                Var v = s.newVar();
-                newInternalVars[make_pair(i, j)] = v;
-                intVars.insert(make_pair(comparator(calls, i, j), v));
+    bool addVariablesBefore = false;
+    if(addVariablesBefore){
+        for (int i = 0; i < d - 1; i++) {
+            for (int j = 0; j < n; j++) {
+                if (j < leadingZeros) {
+                    newInternalVars[make_pair(i, j)] = F;
+                    intVars.insert(make_pair(comparator(calls, i, j), F));
+                } else if (j >= n - tailingOnes) {
+                    newInternalVars[make_pair(i, j)] = T;
+                    intVars.insert(make_pair(comparator(calls, i, j), T));
+                } else {
+                    Var v = s.newVar();
+                    newInternalVars[make_pair(i, j)] = v;
+                    intVars.insert(make_pair(comparator(calls, i, j), v));
+                }
             }
         }
     }
@@ -1325,6 +1332,24 @@ void addInputImprovedEncoding(Solver &s, vector<bool> &newInput, int n, int d, t
     }
     // Add update-rules: 
     for (int i = 0; i < d; i++) {
+        // Create output variables for this layer:
+        for(int j = 0 ; j < n ; j++){
+            if(newInternalVars.count(make_pair(i, j)) == 0){
+                if(j < leadingZeros){
+                    newInternalVars[make_pair(i, j)] = F;
+                    intVars.insert(make_pair(comparator(calls, i, j), F));
+                }
+                else if(j >= n - tailingOnes){
+                    newInternalVars[make_pair(i, j)] = T;
+                    intVars.insert(make_pair(comparator(calls, i, j), T));
+                }
+                else{
+                    Var v = s.newVar();
+                    newInternalVars[make_pair(i, j)] = v;
+                    intVars.insert(make_pair(comparator(calls, i, j), v));
+                }
+            }
+        }
         for (int j = leadingZeros; j < (n - tailingOnes); j++) {
             // Let us assume that the value on this channel is "1". 
             // Thus, this will stay unless there is a comparator down inside the window,
@@ -1385,6 +1410,41 @@ void addInputImprovedEncoding(Solver &s, vector<bool> &newInput, int n, int d, t
                 ps.push(~mkLit(newInternalVars[make_pair(i, j)]));
                 s.addClause(ps);
                 ps.clear();
+            }
+        }
+        if(i <= 5){
+        int fixedFound = 0;
+            for(int j = 0 ; j < n ; j++){
+                if(s.value_at_root_level(newInternalVars[make_pair(i,j)]) != l_Undef){
+                    fixedFound++;
+                }
+            }
+            if(fixedFound == n){
+
+                int lead_here = 0;
+                int tail_here = 0;
+                for(int j = 0 ; j < n ; j++){
+                    if(s.value_at_root_level(newInternalVars[make_pair(i,j)]) == l_False){
+                        lead_here++;
+                    }
+                    else
+                        break;
+                }
+                for(int j = n-1 ; j >= 0 ; j--){
+                    if(s.value_at_root_level(newInternalVars[make_pair(i,j)]) == l_True){
+                        tail_here++;
+                    }
+                    else
+                        break;
+                }
+                if(lead_here != leadingZeros || tail_here != tailingOnes){
+                    if(myMPI_rank <= 0)
+                        printf("c after layer %d: all fixed! %d lead, %d tail (before: %d, %d) \n", i, lead_here, tail_here, leadingZeros, tailingOnes);
+                    assert(lead_here >= leadingZeros);
+                    leadingZeros = lead_here;
+                    assert(tail_here >= tailingOnes);
+                    tailingOnes = tail_here;
+                }
             }
         }
     }
@@ -1624,7 +1684,11 @@ void addSomeInputs(Solver &s, vector<comparator> &compsReadFromFile, int n, int 
         int _in = it->second;
         int _lead = getNumLeadingZeros(_out, n);
         int _tail = getNumTailingOnes(_out, n);
-
+        int _lead2 = getNumLeadingZeros(_in, n);
+        int _tail2 = getNumTailingOnes(_in, n);
+//        if(_lead != _lead2 || _tail != _tail2 && myMPI_rank <= 0){
+//            printf("c leading: %d vs %d, tailing: %d vs %d\n", _lead, _lead2, _tail, _tail2);
+//        }
         testInput t1(_in, _out, _lead, _tail, n - (_lead + _tail));
         possibleInputs.push_back(t1);
 
@@ -2001,13 +2065,13 @@ void addTestLiterals(int layer, int minFrom, int maxTo, int maxLength, triVarMap
 
 void addTest_range(Solver & s, int layer, int n, int channel, map<comparator, Var> &rangeVars, triVarMap &compVarsInCreatedNW){
     // Add variable: one up from channel
-    if(rangeVars.count(comparator(layer, 0, channel)) == 0)
-        addOneFromToRange(s, layer, 0, channel, compVarsInCreatedNW, rangeVars);
+    if(rangeVars.count(comparator(layer, channel, 0)) == 0)
+        addOneFromToRange(s, layer, channel, 0 , compVarsInCreatedNW, rangeVars);
     if(rangeVars.count(comparator(layer, channel, n-1)) == 0)
         addOneFromToRange(s, layer, channel, n-1, compVarsInCreatedNW, rangeVars);
-    if(myMPI_rank <= 0) printf("c rangeVar layer %d range %d - %d : %d\n", layer, 0, channel, rangeVars[comparator(layer, 0, channel)]);
+    if(myMPI_rank <= 0) printf("c rangeVar layer %d range %d - %d : %d\n", layer, 0, channel, rangeVars[comparator(layer, channel, 0)]);
     if(myMPI_rank <= 0) printf("c rangeVar layer %d range %d - %d : %d\n", layer, channel, n-1, rangeVars[comparator(layer, channel, n-1)]);
-    firstCubes.push(mkLit(rangeVars[comparator(layer, 0, channel)]));
+    firstCubes.push(mkLit(rangeVars[comparator(layer, channel, 0)]));
     firstCubes.push(mkLit(rangeVars[comparator(layer, channel, n-1)]));
 
 }
@@ -2180,6 +2244,7 @@ int main(int argc, char **argv) {
         netWorkCreate.verbosity = verb;
         netWorkCreate.mpi_rank = myMPI_rank;
         netWorkCreate.mpi_num_ranks = num_mpi_ranks;
+        netWorksCompare.mpi_rank = -1;
         map<comparator, Var> rangeVars;
         map<comparator, Var> compVarsInCreatedNW;
         map<pair<int, int>, Var> used;
@@ -2234,8 +2299,8 @@ int main(int argc, char **argv) {
                 double t_ = cpuTime();
                 if(myMPI_rank <= 0) netWorkCreate.toDimacs("bla.cnf");
                 if(n >= 16 ){
-                    int minFrom = 5;
-                    int maxTo = n-6;
+                    int minFrom = (n-8)/2;
+                    int maxTo = minFrom + 7;
                     // Last layer:
                     addTestLiterals(d-2, minFrom, maxTo, 3,compVarsInCreatedNW);
                     addTestLiterals(d-1, minFrom, maxTo, 1,compVarsInCreatedNW);
@@ -2274,12 +2339,12 @@ int main(int argc, char **argv) {
                 }
                 bool newNetWorkCreated = findFeasibleNetwork(netWorkCreate, iterations);
 
-                printf("Network Creation took %lf s\n", cpuTime() - t_);
+                if(myMPI_rank <= 0) printf("Network Creation took %lf s\n", cpuTime() - t_);
                 overAllTimeForNetworkCreation += cpuTime() - t_;
                 if (!newNetWorkCreated) {
-                    printf("UNSAT\n");
-                    printf("networkCreate.okay()=%d\n", netWorkCreate.okay());
-                    printf("MaxWindowSize: %d\n", maxWindowSoFar);
+                     if(myMPI_rank <= 0) printf("UNSAT\n");
+                    if(myMPI_rank <= 0) printf("networkCreate.okay()=%d\n", netWorkCreate.okay());
+                    if(myMPI_rank <= 0) printf("MaxWindowSize: %d\n", maxWindowSoFar);
                     done = true;
                 } else {
                     /* print this comparator network */
@@ -2363,6 +2428,7 @@ int main(int argc, char **argv) {
                 printNetwork(netWorkCreate, n, d, compVarsInCreatedNW);
             }
         }
+
         if(myMPI_rank <= 0){
             printf("time was %f s\n", cpuTime() - initial_time);
 
@@ -2376,7 +2442,9 @@ int main(int argc, char **argv) {
         }
         lbool ret = l_Undef;
         if(opt_mpi){
+            printf("c solver %d at final barrier! \n", myMPI_rank);
             MPI_Barrier(MPI_COMM_WORLD);
+            netWorkCreate.readRemainingMessages();
             MPI_Finalize();
         }
 
