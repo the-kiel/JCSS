@@ -1937,6 +1937,8 @@ void Solver::initParameters(){
     default:
         maxDB_size = conflsPerCube * 16;
     }
+    tmp /= 3;
+    use_vsids_branching = tmp % 2;
     printf("c configured: myRank %d, restart %d confls %d maxDB %d\n", mpi_rank, restart_interval, conflsPerCube, maxDB_size);
     //assert(false && "TODO");
 
@@ -1982,9 +1984,9 @@ bool Solver::importFailedCubes(){
     return true;
 }
 
-bool Solver::share_failed_cube(vec<Lit> & ps){
+bool Solver::share_failed_cube(vec<Lit> & ps, vec<Lit> & shared_confl){
     verbosity = 0;
-    printf("c share_failed called! \n");
+    //printf("c share_failed called! \n");
     setConfBudget(2 * ps.size());
     lbool ret = solveLimited(ps);
     assert(ret == l_False);
@@ -2023,7 +2025,21 @@ bool Solver::share_failed_cube(vec<Lit> & ps){
             MPI_Bsend(arr, conflict.size(), MPI_INT, i,TAG_SHARED_FAILED_CUBE , MPI_COMM_WORLD);
         }
     }
-    printf("c share_failed done! \n");
+    confl.clear();
+    for(int i = 0 ; i < shared_confl.size();i++)
+        confl.push_back(toInt(shared_confl[i]));
+    sort(confl.begin(), confl.end());
+    if(master_shared_cubes.count(confl) == 0){
+        master_shared_cubes.insert(confl);
+        // Send it to all others:
+        int arr[confl.size()];
+        for(int i = 0 ; i < confl.size();i++)
+            arr[i] = confl[i];
+        for(int i = 1 ; i < mpi_num_ranks ; i++){
+            MPI_Bsend(arr, conflict.size(), MPI_INT, i,TAG_SHARED_FAILED_CUBE , MPI_COMM_WORLD);
+        }
+    }
+    //printf("c share_failed done! \n");
     return true;
 }
 
@@ -2049,12 +2065,12 @@ bool Solver::failedCube(int * arr, int n, int sender){
         printLit(conflict[i]);
     printf("\n");
     addClause(conflict);
-    share_failed_cube(failedCube);
+    share_failed_cube(failedCube, conflict);
     vec<Lit> failedCube2;
     for(int i = failedCube.size()-1 ; i >= 0; i--){
         failedCube2.push(failedCube[i]);
     }
-    share_failed_cube(failedCube2);
+    share_failed_cube(failedCube2, conflict);
     return false;
 }
 void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_slave_indices, map<int, vector<int> > & lastCubes){
@@ -2219,6 +2235,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
     int solveCalls = 0;
     MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_CUBE_REQUEST, MPI_COMM_WORLD);
     int fixed = getNumFixedVars();
+    int numUNSATfound = 0;
     while(!done){
         if(getNumFixedVars() != fixed){
             printf("c slave %d got new units, running FL check! \n", mpi_rank);
@@ -2248,29 +2265,55 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 bool shortCube = solveCalls < 4 || length <= opt_shortCube;
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
-                if(length <= opt_shortCube)
+                /*if(length <= opt_shortCube)
                     setConfBudget(10);
                 else{
-                    setConfBudget(conflsPerCube);
-                }
+                    Lit testLit = getNextBranchLitFromList(ass, firstCubes);
+                    int budgetHere = testLit == lit_Undef ? 10 * 1000 : conflsPerCube;
+
+                    setConfBudget(budgetHere);
+
+
+                }*/
                 //printf("c slave %d calling solve\n",mpi_rank );
                 int conflsBefore = conflicts;
                 solveCalls++;
                 lbool ret ;
-                if(shortCube)
+                if(shortCube){
+                    setConfBudget(100);
                     ret  = solveLimited(ass);
+                }
                 else{
                     setConfBudget(2000);
                     ret = solveLimited(ass);
                     if(ret == l_Undef){
                         FL_Check_With_Assumptions(ass);
-                        setConfBudget(conflsPerCube);
+                        Lit testLit = getNextBranchLitFromList(ass, firstCubes);
+                        int budgetHere = conflsPerCube;
+                        if(testLit == lit_Undef && numUNSATfound==0)
+                                budgetHere = 10 * 1000;
+
+                        setConfBudget(budgetHere);
+                        //setConfBudget(conflsPerCube);
                         ret = solveLimited(ass);
                     }
                 }
 
                 if(ret == l_False){
+                    numUNSATfound++;
                     printf("c solver %d cube failed after %d conflicts\n", mpi_rank, conflicts - conflsBefore);
+                    if(conflict.size() > 1){
+                        vec<Lit> confl1;
+                        for(int i = 0 ; i < conflict.size();i++)
+                            confl1.push(conflict[i]);
+                        reverse(ass);
+                        setConfBudget(1000);
+                        lbool ret2 = solveLimited(ass);
+                        assert(ret2 == l_False);
+                        if(conflict.size() != confl1.size()){
+                            printf("c solver %d, reverse analysis: got failed cube of size %d! \n", mpi_rank, conflict.size());
+                        }
+                    }
                     int arr[2 + conflict.size() + ass.size()];
                     arr[0] = ass.size();
                     arr[1] = conflict.size();
@@ -2308,13 +2351,17 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 }
                 else{
                     printf("c cube not solved, sending answer to master! \n");
+
+                    //if(next_jw == lit_Undef)
                     Lit next = getNextBranchLitFromList(ass, firstCubes);
                     /*if(ass.size() <= 3)
                         next = checkTuplePairs( ass, firstCubes);
                         //next = getNextBranchLit_expensive(ass, firstCubes);
                     else
                         next = getNextLitWithMostPropagations(ass, firstCubes); //getNextBranchLitFromList(ass, firstCubes);*/
-
+                    assert(0 == decisionLevel());
+                    if(next == lit_Undef && !use_vsids_branching)
+                        next = getBranchLit_JW(ass);
                     assert(0 == decisionLevel());
                     if(next == lit_Undef)
                         next = getNextBranchLit(ass);
@@ -2810,4 +2857,81 @@ void Solver::readRemainingMessages(){
         }
     }
     printf("c done, solver %d had %d remaining messages! \n", mpi_rank, messagesRead);
+}
+
+Lit Solver::getBranchLit_JW(vec<Lit> & ass){
+    double t = cpuTime();
+    vector<int> occurs_var(nVars());
+    vector<int> occurs_lit(2*nVars());
+    Lit ret = lit_Undef;
+    vector<double> rating_jw_lit(2*nVars());
+    vector<double> rating_jw_var(nVars());
+    int satClauses = 0;
+    if(!restoreTrail(ass)){
+        return ret;
+    }
+    int mostOccuringVar = var_Undef;
+    int mostOccuringLit = -1;
+    int index_best_lit_jw = -1;
+    int index_best_var_jw = -1;
+    for(int i = 0 ; i < learnts.size();i++){
+        Clause & c = ca[learnts[i]];
+        int satFound=0;
+        int freeVars = 0;
+        for(int j = 0 ; j < c.size() && satFound == 0 ; j++){
+            lbool val = value(c[j]);
+            if(val == l_True)
+                satFound++;
+            else if(val == l_Undef)
+                freeVars++;
+        }
+        if(satFound > 0)
+            satClauses++;
+        else{
+            for(int j = 0 ; j < c.size() ; j++){
+                if(value(c[j]) == l_Undef){
+                    occurs_var[var(c[j])]++;
+                    occurs_lit[toInt(c[j])]++;
+                    rating_jw_lit[toInt(c[j])] += std::pow(0.5, freeVars);
+                    rating_jw_var[var(c[j])] += std::pow(0.5, freeVars);
+                    if(mostOccuringVar < 0 || occurs_var[var(c[j])] > occurs_var[mostOccuringVar])
+                        mostOccuringVar = var(c[j]);
+                    if(mostOccuringLit < 0 || occurs_lit[toInt(c[j])] > occurs_lit[mostOccuringLit])
+                        mostOccuringLit = toInt(c[j]);
+
+                    if(index_best_var_jw < 0 || rating_jw_var[var(c[j])] > rating_jw_var[index_best_var_jw])
+                        index_best_var_jw = var(c[j]);
+                    if(index_best_lit_jw < 0 || rating_jw_lit[toInt(c[j])] > rating_jw_lit[index_best_lit_jw])
+                        index_best_lit_jw = toInt(c[j]);
+                }
+
+            }
+        }
+    }
+    cancelUntil(0);
+    if(index_best_lit_jw < 0 || index_best_var_jw < 0){
+        printf("c could not find anything meainingful with JW! \n");
+        return lit_Undef;
+    }
+    printf("c solver %d JW check on learnts done. Checked %d clauses, %d were sat, most occuring var %d (%d), most occuring lit %d (%d), best Var jw %d (%lf), best Lit jw %d (%lf) time was %lf\n",
+           mpi_rank,
+           learnts.size(), satClauses, mostOccuringVar, occurs_var[mostOccuringVar],
+           mostOccuringLit & 1 ? -mostOccuringLit/2: mostOccuringLit/2, occurs_lit[mostOccuringLit],
+           index_best_var_jw, rating_jw_var[index_best_var_jw],
+           index_best_lit_jw & 1 ? -index_best_lit_jw/2 : index_best_lit_jw/2, rating_jw_lit[index_best_lit_jw], cpuTime()-t);
+    return ~toLit(index_best_lit_jw);
+}
+
+void Solver::reverse(vec<Lit> & arr){
+    for(int i = 0 ; i < arr.size()/2 ; i++){
+        int other = arr.size()-i-1;
+        Lit tmp = arr[other];
+        arr[other] = arr[i];
+        arr[i] = tmp;
+    }
+}
+
+int Solver::query_master_num_open_jobs(){
+    MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_MASTER_OPEN_JOBS, MPI_COMM_WORLD);
+    // TODO
 }

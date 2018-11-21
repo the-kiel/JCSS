@@ -2305,12 +2305,12 @@ int main(int argc, char **argv) {
                     addTestLiterals(d-2, minFrom, maxTo, 3,compVarsInCreatedNW);
                     addTestLiterals(d-1, minFrom, maxTo, 1,compVarsInCreatedNW);
                     addTestLiterals(d-3, minFrom, maxTo, 8,compVarsInCreatedNW);
-                    for(int i = minFrom ; i <= maxTo ; i++)
-                        addTest_range(netWorkCreate, d-1, n, i, rangeVars, compVarsInCreatedNW);
+//                    for(int i = minFrom ; i <= maxTo ; i++)
+//                        addTest_range(netWorkCreate, d-1, n, i, rangeVars, compVarsInCreatedNW);
                     for(int i = minFrom ; i <= maxTo ; i++)
                         addTest_range(netWorkCreate, d-2, n, i, rangeVars, compVarsInCreatedNW);
-                    for(int i = minFrom ; i <= maxTo ; i++)
-                        addTest_range(netWorkCreate, d-3, n, i, rangeVars, compVarsInCreatedNW);
+                   // for(int i = minFrom ; i <= maxTo ; i++)
+                   //     addTest_range(netWorkCreate, d-3, n, i, rangeVars, compVarsInCreatedNW);
                     // TODO: Add some noneUp/noneDown???
 
                     //addTestLiterals_oneIn(d-2, n, minFrom, maxTo, compVarsInCreatedNW);

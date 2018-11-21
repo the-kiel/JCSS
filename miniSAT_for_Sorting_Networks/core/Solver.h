@@ -39,7 +39,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #define TAG_NEW_CUBE_FOR_MASTER     6
 #define TAG_SHARED_FAILED_CUBE      7
 #define TAG_STEAL_REQUEST           8
-
+#define TAG_MASTER_OPEN_JOBS        9
 namespace Minisat {
 
 //=================================================================================================
@@ -208,7 +208,7 @@ public:
     int conflsPerCube;
     std::set<std::vector<int> > master_shared_cubes;
     std::set<int> master_shared_units;
-    bool share_failed_cube(vec<Lit> & ps);
+    bool share_failed_cube(vec<Lit> & ps, vec<Lit> & shared_confl);
     bool importFailedCubes();
     bool stealRequestPending;
     bool terminateRun;
@@ -224,6 +224,10 @@ public:
     vec<Lit> lastSolutionDLs;
     bool countSolutions;
     void readRemainingMessages();
+    Lit getBranchLit_JW(vec<Lit> & ass);
+    void reverse(vec<Lit> & arr);
+    int query_master_num_open_jobs();
+    bool use_vsids_branching;
 protected:
 
     // Helper structures:
