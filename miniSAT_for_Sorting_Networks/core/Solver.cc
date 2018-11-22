@@ -2037,7 +2037,7 @@ bool Solver::share_failed_cube(vec<Lit> & ps, vec<Lit> & shared_confl){
         for(int i = 0 ; i < confl.size();i++)
             arr[i] = confl[i];
         for(int i = 1 ; i < mpi_num_ranks ; i++){
-            MPI_Bsend(arr, conflict.size(), MPI_INT, i,TAG_SHARED_FAILED_CUBE , MPI_COMM_WORLD);
+            MPI_Bsend(arr, confl.size(), MPI_INT, i,TAG_SHARED_FAILED_CUBE , MPI_COMM_WORLD);
         }
     }
     //printf("c share_failed done! \n");
