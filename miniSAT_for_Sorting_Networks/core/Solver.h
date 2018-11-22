@@ -228,6 +228,7 @@ public:
     void reverse(vec<Lit> & arr);
     int query_master_num_open_jobs();
     bool use_vsids_branching;
+    bool check_import_clause(vec<Lit> & ps);
 protected:
 
     // Helper structures:

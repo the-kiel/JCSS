@@ -1959,7 +1959,8 @@ bool Solver::importFailedCubes(){
             vec<Lit> ps;
             for(int i = 0 ; i < length ; i++)
                 ps.push(toLit(arr[i]));
-            addClause(ps);
+            if(check_import_clause(ps))
+                addClause(ps);
             if(!ok){
                 printf("c got conflict while importing shared failed cube of size %d\n", length);
                 return false;
@@ -2262,7 +2263,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                     printIntLit(arr[i]);
                 }
                 printf("\n");
-                bool shortCube = solveCalls < 4 || length <= opt_shortCube;
+                bool shortCube = length <= opt_shortCube;
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
                 /*if(length <= opt_shortCube)
@@ -2302,7 +2303,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 if(ret == l_False){
                     numUNSATfound++;
                     printf("c solver %d cube failed after %d conflicts\n", mpi_rank, conflicts - conflsBefore);
-                    if(conflict.size() > 1){
+                    /*if(conflict.size() > 1){
                         vec<Lit> confl1;
                         for(int i = 0 ; i < conflict.size();i++)
                             confl1.push(conflict[i]);
@@ -2313,7 +2314,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                         if(conflict.size() != confl1.size()){
                             printf("c solver %d, reverse analysis: got failed cube of size %d! \n", mpi_rank, conflict.size());
                         }
-                    }
+                    }*/
                     int arr[2 + conflict.size() + ass.size()];
                     arr[0] = ass.size();
                     arr[1] = conflict.size();
@@ -2935,3 +2936,17 @@ int Solver::query_master_num_open_jobs(){
     MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_MASTER_OPEN_JOBS, MPI_COMM_WORLD);
     // TODO
 }
+
+ bool Solver::check_import_clause(vec<Lit> & ps){
+     bool isOkay = true;
+     for(int i = 0 ; i < ps.size();i++)
+         if(var(ps[i]) <= 0 || var(ps[i]) > nVars())
+             isOkay = false;
+     if(!isOkay){
+         printf("c solver %d received weird clause: ");
+         for(int i = 0 ; i < ps.size();i++)
+             printLit(ps[i]);
+         printf("\n");
+     }
+     return isOkay;
+ }
