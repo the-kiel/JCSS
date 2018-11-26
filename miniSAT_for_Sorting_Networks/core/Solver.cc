@@ -1696,7 +1696,7 @@ bool Solver::check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec
             uncheckedEnqueue(ass[i]);
             CRef confl = propagate();
             if(confl != CRef_Undef){
-                printf("c got confl while propagating trail! \n");
+                printf("c solver %d FL-check: got confl while propagating trail! \n", mpi_rank);
                 return true;
             }
         }
@@ -1771,16 +1771,24 @@ bool Solver::FL_Check_With_Assumptions(vec<Lit> & ass){
     int root_level_ts = trail.size();
     double t = cpuTime();
     if(!restoreTrail(ass)){
-        printf("c could not restore trail...\n");
+        printf("c solver %d could not restore trail...\n", mpi_rank);
+        if(decisionLevel() != 0){
+            printf("c solver %d did not backtrack properly! \n", mpi_rank);
+            cancelUntil(0);
+        }
         return false;
     }
     int tsBefore = trail.size();
     vector<bool> seenHere(2*nVars(), false);
     for(int i = 0 ; i < nVars();i++){
-        if(check_lit_with_assumptions(mkLit(i), seenHere, ass))
+        if(check_lit_with_assumptions(mkLit(i), seenHere, ass)){
+            cancelUntil(0);
             return false;
-        if(check_lit_with_assumptions(~mkLit(i), seenHere, ass))
+        }
+        if(check_lit_with_assumptions(~mkLit(i), seenHere, ass)){
+            cancelUntil(0);
             return false;
+        }
     }
     //printf("c conditional FL check done! \n");
     restoreTrail(ass);
@@ -1817,6 +1825,10 @@ Lit    Solver::getNextBranchLit(vec<Lit> & ass)
 }
 
 Lit Solver::getNextBranchLitFromList(vec<Lit> & ass, vec<Lit> & list){
+    if(decisionLevel() != 0){
+        printf("c solver %d, getting branch lit: DL was not 0! \n", mpi_rank);
+        cancelUntil(0);
+    }
     assert(0 == decisionLevel());
     cancelUntil(0);
     for(int i = 0 ; i < ass.size();i++){
@@ -1837,7 +1849,17 @@ Lit Solver::getNextBranchLitFromList(vec<Lit> & ass, vec<Lit> & list){
         }
     }
     Lit rVal = lit_Undef;
+    int bestIndex = -1;
+    /*for(map<int, int>::iterator it = branch_orders.begin() ; it != branch_orders.end();it++){
+        printf("c solver %d variable %d has ranking %d\n", mpi_rank, it->first, it->second);
+    }*/
     for(int i = 0 ; i < list.size();i++){
+        /*if(value(list[i]) == l_Undef){
+            if(bestIndex < 0 || activity[var(list[i])] > activity[var(list[bestIndex])]){
+                bestIndex = i;
+                rVal = list[i];
+            }
+        }*/
         if(value(list[i]) == l_Undef){
             rVal = list[i];
             break;
@@ -1929,13 +1951,13 @@ void Solver::initParameters(){
     // Max size of clause DB: 200000, 500000, 1000000
     switch(tmp % 3){
     case 0:
-        maxDB_size = conflsPerCube * 4;
+        maxDB_size = conflsPerCube * 2;
         break;
     case 1:
-        maxDB_size = conflsPerCube * 8;
+        maxDB_size = conflsPerCube * 4;
         break;
     default:
-        maxDB_size = conflsPerCube * 16;
+        maxDB_size = conflsPerCube * 8;
     }
     tmp /= 3;
     use_vsids_branching = tmp % 2;
@@ -2074,6 +2096,18 @@ bool Solver::failedCube(int * arr, int n, int sender){
     share_failed_cube(failedCube2, conflict);
     return false;
 }
+
+double Solver::getJobRanking(vector<int> & cube){
+    double rVal = 0.0;
+    double factor = 1.0;
+    for(int i = 0 ; i < cube.size();i++){
+        if(cube[i] % 2 == 0)
+            rVal += factor;
+        factor /= 2.0;
+    }
+    return rVal;
+}
+
 void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_slave_indices, map<int, vector<int> > & lastCubes){
     printf("c looking for job for slave\n");
     int nextSlave = idle_slave_indices.back();
@@ -2082,10 +2116,16 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
     int shortestFoundIndex = 0;
     int longestPrefix = -1;
     int bestIndex = -1;
-
+    double bestRanking = 0.0;
+    int index_best_ranking = 0;
+    bool useRanking = false;
     for(int i = 0 ; i < open_cubes.size();i++){
         if(open_cubes[i].size() < open_cubes[shortestFoundIndex].size())
             shortestFoundIndex = i;
+        if(getJobRanking(open_cubes[i]) > bestRanking){
+            bestRanking = getJobRanking(open_cubes[i]);
+            index_best_ranking = i;
+        }
         if(lastCubes.find(nextSlave) != lastCubes.end()){
             int sz = 0;
             vector<int> & lastPref = lastCubes[nextSlave];
@@ -2103,6 +2143,11 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
     if(open_cubes[shortestFoundIndex].size() <=opt_shortCube  || bestIndex < 0){
         nextCube.insert(nextCube.end(), open_cubes[shortestFoundIndex].begin(), open_cubes[shortestFoundIndex].end());
         open_cubes[shortestFoundIndex] = open_cubes.back();
+        open_cubes.pop_back();
+    }
+    else if(useRanking && longestPrefix < opt_shortCube -1){
+        nextCube.insert(nextCube.end(), open_cubes[index_best_ranking].begin(), open_cubes[index_best_ranking].end());
+        open_cubes[index_best_ranking] = open_cubes.back();
         open_cubes.pop_back();
     }
     else{
@@ -2198,6 +2243,23 @@ bool Solver::master_solve(){
                 open_cubes.push_back(newCube);
                 break;
             }
+            case TAG_NEW_UNIT_CLAUSE:
+            {
+                if(decisionLevel() != 0)
+                    cancelUntil(0);
+                MPI_Get_count(&s, MPI_INT, &length);
+                if(length != 1){
+                    printf("c this is weird, received unit clause but size != 1??? \n");
+                }
+                int val;
+                MPI_Recv(&val, length, MPI_INT, s.MPI_SOURCE, s.MPI_TAG, MPI_COMM_WORLD, &s);
+                bool succ = master_add_unit(val);
+                if(!succ){
+                    printf("c got UNSAT here! \n");
+                    done = true;
+                }
+                break;
+            }
             default:
                 printf("c master received weird message: %d\n", s.MPI_TAG);
                 // MPI_Get_count(&s, MPI_INT, &length);
@@ -2231,6 +2293,8 @@ bool Solver::master_solve(){
 }
 
 void Solver::slave_solve(vec<Lit> & firstCubes){
+    for(int i = 0 ; i < firstCubes.size();i++)
+        branchLiterals.push(firstCubes[i]);
     verbosity = 0;
     bool done = false;
     int solveCalls = 0;
@@ -2243,6 +2307,8 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
             cancelUntil(0);
             FL_Check_fast();
             cancelUntil(0);
+            slave_share_units(fixed);
+            // TODO: Export
             fixed = getNumFixedVars();
         }
         MPI_Status s;
@@ -2264,6 +2330,17 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 }
                 printf("\n");
                 bool shortCube = length <= opt_shortCube;
+                if(numUNSATfound == 0){
+                    double rank = 0.0;
+                    for(int i = 0 ; i < arr[i] ; i++){
+                        if(arr[i] % 2 == 0)
+                            rank += 1;
+                        else
+                            rank += 0.7;
+                    }
+                    if(rank <= opt_shortCube)
+                        shortCube = true;
+                }
                 for(int i = 0 ; i < length ; i++)
                     ass.push(toLit(arr[i]));
                 /*if(length <= opt_shortCube)
@@ -2281,7 +2358,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 solveCalls++;
                 lbool ret ;
                 if(shortCube){
-                    setConfBudget(100);
+                    setConfBudget(5000);
                     ret  = solveLimited(ass);
                 }
                 else{
@@ -2584,6 +2661,7 @@ void Solver::reduceDB_with_assumptions(vec<Lit> & ass){
 // NOTE: assumptions passed in member-variable 'assumptions'.
 lbool Solver::solve_()
 {
+    //branch_orders.clear();
     model.clear();
     conflict.clear();
     if (!ok) return l_False;
@@ -2628,6 +2706,12 @@ lbool Solver::solve_()
         }
         status = search(restart_interval);
         if (!withinBudget()) break;
+        /*if(status == l_Undef && ok){
+            if(restoreTrail(assumptions)){
+                updateBranchOrders();
+            }
+            cancelUntil(0);
+        }*/
         curr_restarts++;
         if(conflicts > conflsNextCheck && status == l_Undef && opt_subsumptionTests){
             printf("c running tests, dynThreshold=%lf\n", dyn_threshold);
@@ -2869,6 +2953,7 @@ Lit Solver::getBranchLit_JW(vec<Lit> & ass){
     vector<double> rating_jw_var(nVars());
     int satClauses = 0;
     if(!restoreTrail(ass)){
+        cancelUntil(0);
         return ret;
     }
     int mostOccuringVar = var_Undef;
@@ -2935,6 +3020,7 @@ void Solver::reverse(vec<Lit> & arr){
 int Solver::query_master_num_open_jobs(){
     MPI_Bsend(NULL, 0, MPI_INT, 0, TAG_MASTER_OPEN_JOBS, MPI_COMM_WORLD);
     // TODO
+    return 0;
 }
 
  bool Solver::check_import_clause(vec<Lit> & ps){
@@ -2943,10 +3029,57 @@ int Solver::query_master_num_open_jobs(){
          if(var(ps[i]) <= 0 || var(ps[i]) > nVars())
              isOkay = false;
      if(!isOkay){
-         printf("c solver %d received weird clause: ");
+         printf("c solver %d received weird clause: ", mpi_rank);
          for(int i = 0 ; i < ps.size();i++)
              printLit(ps[i]);
          printf("\n");
      }
      return isOkay;
  }
+void Solver::slave_share_units(int lastIndexKnown){
+    cancelUntil(0);
+    for(int i = lastIndexKnown ; i < trail.size();i++){
+        int int_lit = toInt(trail[i]);
+        MPI_Bsend(&int_lit, 1, MPI_INT, 0 ,TAG_NEW_UNIT_CLAUSE , MPI_COMM_WORLD);
+    }
+}
+/*
+ * Return true if everything is okay, and false if this is a conflict
+ * */
+bool Solver::master_add_unit(int val){
+    cancelUntil(0);
+    vector<int> this_clause;
+    Lit l = toLit(val);
+    if(value(l) == l_True){
+        return true;
+    }
+    if(value(l) == l_False)
+        return false;
+    uncheckedEnqueue(l);
+    CRef confl = propagate();
+    if(confl != CRef_Undef){
+        printf("c master got UNSAT while propagating ");
+        printLit(l);
+        printf("\n");
+        return false;
+    }
+    // Send this clause to other solvers:
+    for(int i = 1 ; i < mpi_num_ranks ; i++){
+        MPI_Bsend(&val, 1, MPI_INT, i,TAG_SHARED_FAILED_CUBE , MPI_COMM_WORLD);
+    }
+    return true;
+}
+
+void Solver::updateBranchOrders(){
+    vector<pair<double, int> > act_branchers;
+    for(int i = 0 ; i < branchLiterals.size();i++){
+        if(value(branchLiterals[i]) == l_Undef){
+            act_branchers.push_back(make_pair(activity[var(branchLiterals[i])], var(branchLiterals[i])));
+        }
+        if(act_branchers.size() > 0){
+            std::sort(act_branchers.begin(), act_branchers.end());
+            for(int i = 0 ; i < act_branchers.size();i++)
+                branch_orders[act_branchers[i].second] += i;
+        }
+    }
+}

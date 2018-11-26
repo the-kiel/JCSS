@@ -40,6 +40,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #define TAG_SHARED_FAILED_CUBE      7
 #define TAG_STEAL_REQUEST           8
 #define TAG_MASTER_OPEN_JOBS        9
+#define TAG_NEW_UNIT_CLAUSE         10
 namespace Minisat {
 
 //=================================================================================================
@@ -229,6 +230,12 @@ public:
     int query_master_num_open_jobs();
     bool use_vsids_branching;
     bool check_import_clause(vec<Lit> & ps);
+    double getJobRanking(std::vector<int> & cube);
+    void slave_share_units(int lastIndexKnown);
+    bool master_add_unit(int lit);
+    vec<Lit> branchLiterals;
+    std::map<int, int> branch_orders;
+    void updateBranchOrders();
 protected:
 
     // Helper structures:

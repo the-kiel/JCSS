@@ -2302,6 +2302,7 @@ int main(int argc, char **argv) {
                     int minFrom = (n-8)/2;
                     int maxTo = minFrom + 7;
                     // Last layer:
+                    addTestLiterals(d-1, n/2-1, n/2, 1,compVarsInCreatedNW);
                     addTestLiterals(d-2, minFrom, maxTo, 3,compVarsInCreatedNW);
                     addTestLiterals(d-1, minFrom, maxTo, 1,compVarsInCreatedNW);
                     addTestLiterals(d-3, minFrom, maxTo, 8,compVarsInCreatedNW);
