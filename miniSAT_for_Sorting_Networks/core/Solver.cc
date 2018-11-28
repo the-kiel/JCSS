@@ -3154,14 +3154,16 @@ void Solver::genTestCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_
 
     // Take one in the middle of size 13
     for(int i = allCubes.size()/2 ; i < allCubes.size();i++){
-        if(allCubes[i].size() == 13)
+        if(allCubes[i].size() == 13){
             cubes_out.push_back(allCubes[i]);
             break;
+        }
     }
     // take the last one of size 15
     for(int i = allCubes.size()-1 ; i >= 0 ;i--){
-        if(allCubes[i].size() == 15)
+        if(allCubes[i].size() == 15){
             cubes_out.push_back(allCubes[i]);
             break;
+        }
     }
 }

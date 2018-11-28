@@ -2297,7 +2297,7 @@ int main(int argc, char **argv) {
                 if(myMPI_rank <= 0) printf("Internal vars: %d and %d\n", compVarsInCreatedNW.size(), compVarsInTestNW.size());
                 if(myMPI_rank <= 0) printf("looking for a feasible network: \n");
                 double t_ = cpuTime();
-                if(myMPI_rank <= 0) netWorkCreate.toDimacs("bla.cnf");
+                //if(myMPI_rank <= 0) netWorkCreate.toDimacs("bla.cnf");
                 if(n >= 16 ){
                     int minFrom = (n-8)/2;
                     int maxTo = minFrom + 7;
