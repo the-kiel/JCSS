@@ -67,6 +67,9 @@ static IntOption     opt_maxDB          (_cat, "maxDB",      "Size of learnt cla
 static BoolOption    opt_subsumptionTests       (_cat, "subTests",        "Use subsumption tests on core learnt clauses", false);
 
 static IntOption     opt_shortCube     (_cat, "shortCube",      "Cubes with this size will be considered small", 6, IntRange(0, INT32_MAX));
+
+static BoolOption    opt_testConfigurations       (_cat, "testConfigs",        "Test possible configurations", false);
+static IntOption     opt_testConfigIndex     (_cat, "config2Test",      "Cubes with this size will be considered small", 6, IntRange(0, INT32_MAX));
 //=================================================================================================
 // Constructor/Destructor:
 
@@ -1769,6 +1772,7 @@ bool Solver::check_lit_with_assumptions(Lit l, std::vector<bool> & seenHere, vec
 bool Solver::FL_Check_With_Assumptions(vec<Lit> & ass){
     cancelUntil(0);
     int root_level_ts = trail.size();
+    phase_saving = 0;
     double t = cpuTime();
     if(!restoreTrail(ass)){
         printf("c solver %d could not restore trail...\n", mpi_rank);
@@ -1776,6 +1780,7 @@ bool Solver::FL_Check_With_Assumptions(vec<Lit> & ass){
             printf("c solver %d did not backtrack properly! \n", mpi_rank);
             cancelUntil(0);
         }
+        phase_saving = 2;
         return false;
     }
     int tsBefore = trail.size();
@@ -1783,10 +1788,12 @@ bool Solver::FL_Check_With_Assumptions(vec<Lit> & ass){
     for(int i = 0 ; i < nVars();i++){
         if(check_lit_with_assumptions(mkLit(i), seenHere, ass)){
             cancelUntil(0);
+            phase_saving = 2;
             return false;
         }
         if(check_lit_with_assumptions(~mkLit(i), seenHere, ass)){
             cancelUntil(0);
+            phase_saving = 2;
             return false;
         }
     }
@@ -1795,6 +1802,7 @@ bool Solver::FL_Check_With_Assumptions(vec<Lit> & ass){
     int newRootLevelTrailSize = decisionLevel() == 0 ? trail.size() : trail_lim[0];
     printf("c solver %d trail size %d -> %d in time %lf (root %d -> %d)\n", mpi_rank, tsBefore, trail.size(), cpuTime()-t, root_level_ts,newRootLevelTrailSize );
     cancelUntil(0);
+    phase_saving = 2;
     return true;
 
 }
@@ -1922,10 +1930,10 @@ void Solver::initMPIStuff(){
 
 void Solver::initParameters(){
     printf("c TODO: Adjust parameters! \n");
-    int tmp = mpi_rank;
+    int tmp = opt_testConfigurations ? :  mpi_rank;
     // Restart interval: 1024, 2048 or 4096
     restart_interval = 2048;
-    /*switch(tmp % 3){
+    switch(tmp % 3){
     case 0:
         restart_interval = 1024;
         break;
@@ -1935,13 +1943,16 @@ void Solver::initParameters(){
     default:
         restart_interval = 4096;
     }
-    tmp /= 3;*/
+    tmp /= 3;
     // conflicts per cube: 100000, 250000
     switch(tmp % 2){
     case 0:
-        conflsPerCube = 100 * 1000;
+        conflsPerCube = 50 * 1000;
         break;
     case 1:
+        conflsPerCube = 100 * 1000;
+        break;
+    case 2:
         conflsPerCube = 250 * 1000;
         break;
     default:
@@ -2166,16 +2177,26 @@ void Solver::sendNextJob(vector<vector<int> > & open_cubes, vector<int> & idle_s
     MPI_Bsend(arr, nextCube.size(), MPI_INT, nextSlave, TAG_NEW_CUBE_FOR_SLAVE, MPI_COMM_WORLD);
 }
 
-bool Solver::master_solve(){
+bool Solver::master_solve(vec<Lit> & firstCubes){
     vector<vector<int> > open_cubes;
     vector<int> progress;
-    open_cubes.push_back(vector<int>());
+    if(opt_testConfigurations){
+        double t = MPI_Wtime();
+        genTestCubes(firstCubes, open_cubes);
+        printf("c generated %d cubes in time %lf\n", open_cubes.size(), MPI_Wtime()-t);
+
+
+    }
+    else{
+        open_cubes.push_back(vector<int>());
+    }
     vector<int> idle_slave_indices;
     vec<Lit> guide_to_sat;
     map<int, vector<int> > lastCube;
     bool done = false;
     bool foundSAT = false;
     double time_last_steal_request = MPI_Wtime();
+    double time_start = MPI_Wtime();
     while(!done){
         if(open_cubes.size() > 0 && idle_slave_indices.size() > 0){
             // Pick a solver and send next cube:
@@ -2272,7 +2293,10 @@ bool Solver::master_solve(){
     // Am I done?
         if(idle_slave_indices.size() == mpi_num_ranks-1 && open_cubes.size() == 0 && progress.size() > 0){
             printf("c checking progress...\n");
-            assert(progress[0] == 1);
+            if(!opt_testConfigurations)
+                assert(progress[0] == 1);
+            else
+                printf("c test done in time %lf\n", MPI_Wtime() - time_start);
             done = true;
         }
     }
@@ -2504,7 +2528,7 @@ lbool Solver::mpi_solve(vec<Lit> & firstCubes){
     lbool ret = l_False;
     printf("c mpi_solve, rank=%d\n", mpi_rank);
     if(mpi_rank == 0){
-        bool succ = master_solve();
+        bool succ = master_solve(firstCubes);
         if(succ){
             ret = l_True;
         }
@@ -3081,5 +3105,63 @@ void Solver::updateBranchOrders(){
             for(int i = 0 ; i < act_branchers.size();i++)
                 branch_orders[act_branchers[i].second] += i;
         }
+    }
+}
+
+void Solver::genCubes(vec<Lit> & ps, int index, vec<Lit> & currentCube, std::vector<std::vector<int> > & cubes_out, int noConflicts, double ranking){
+    if(index >= ps.size() || ranking >= 15){
+        // Nothing to do, just backtrack
+    }
+    else{
+        setConfBudget(noConflicts);
+        lbool ret = solveLimited(currentCube);
+        if(ret == l_True){
+            printf("c got SAT answer??? \n");
+        }
+        else if(ret == l_Undef){
+            vector<int> newCube;
+            for(int i = 0 ; i < currentCube.size();i++)
+                newCube.push_back(toInt(currentCube[i]));
+            cubes_out.push_back(newCube);
+            if(cubes_out.size() % 1000 == 0){
+                printf("c generated %d cubes so far! \n", cubes_out.size());
+            }
+            currentCube.push(ps[index]);
+            genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking+1);
+            currentCube.pop();
+            currentCube.push(~ps[index]);
+            genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking+0.7);
+            currentCube.pop();
+        }
+    }
+}
+void Solver::genAllCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_out){
+    vec<Lit> tmp;
+    verbosity = 0;
+    genCubes(ps, 0, tmp, cubes_out, 1, 0.0);
+    verbosity = 1;
+}
+void Solver::genTestCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_out){
+    vector<vector<int> > allCubes;
+    genAllCubes(ps, allCubes);
+    // Take the first one of size 12
+    for(int i = 0 ; i < allCubes.size();i++){
+        if(allCubes[i].size() == 12){
+            cubes_out.push_back(allCubes[i]);
+            break;
+        }
+    }
+
+    // Take one in the middle of size 13
+    for(int i = allCubes.size()/2 ; i < allCubes.size();i++){
+        if(allCubes[i].size() == 13)
+            cubes_out.push_back(allCubes[i]);
+            break;
+    }
+    // take the last one of size 15
+    for(int i = allCubes.size()-1 ; i >= 0 ;i--){
+        if(allCubes[i].size() == 15)
+            cubes_out.push_back(allCubes[i]);
+            break;
     }
 }

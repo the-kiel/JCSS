@@ -199,7 +199,7 @@ public:
     lbool mpi_solve(vec<Lit> & firstCubes);
     void initMPIStuff();
     void initParameters();
-    bool master_solve();
+    bool master_solve(vec<Lit> & firstCube);
     void slave_solve(vec<Lit> & firstCubes);
     void sendNextJob(std::vector<std::vector<int> > & open_cubes, std::vector<int> & idle_slave_indices, std::map<int, std::vector<int> > & lastCubes);
     bool failedCube(int * arr, int n, int sender);
@@ -236,6 +236,9 @@ public:
     vec<Lit> branchLiterals;
     std::map<int, int> branch_orders;
     void updateBranchOrders();
+    void genAllCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_out);
+    void genTestCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_out);
+    void genCubes(vec<Lit> & ps, int index, vec<Lit> & currentCube, std::vector<std::vector<int> > & cubes_out,  int noConflicts, double ranking);
 protected:
 
     // Helper structures:
