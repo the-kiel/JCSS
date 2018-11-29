@@ -1885,7 +1885,7 @@ bool    Solver::restoreTrail(vec<Lit> & ass){
             uncheckedEnqueue(ass[i]);
             CRef confl = propagate();
             if(confl != CRef_Undef){
-                printf("c got conflict while restoring trail! \n");
+                //printf("c got conflict while restoring trail! \n");
                 cancelUntil(0);
                 return false;
             }
@@ -1930,7 +1930,7 @@ void Solver::initMPIStuff(){
 
 void Solver::initParameters(){
     printf("c TODO: Adjust parameters! \n");
-    int tmp = opt_testConfigurations ? :  mpi_rank;
+    int tmp = opt_testConfigurations ? opt_testConfigIndex :  mpi_rank;
     // Restart interval: 1024, 2048 or 4096
     restart_interval = 2048;
     switch(tmp % 3){
@@ -1945,7 +1945,7 @@ void Solver::initParameters(){
     }
     tmp /= 3;
     // conflicts per cube: 100000, 250000
-    switch(tmp % 2){
+    switch(tmp % 3){
     case 0:
         conflsPerCube = 50 * 1000;
         break;
@@ -3109,30 +3109,72 @@ void Solver::updateBranchOrders(){
 }
 
 void Solver::genCubes(vec<Lit> & ps, int index, vec<Lit> & currentCube, std::vector<std::vector<int> > & cubes_out, int noConflicts, double ranking){
-    if(index >= ps.size() || ranking >= 15){
+    if(index >= ps.size() || ranking >= 14){
         // Nothing to do, just backtrack
     }
     else{
-        setConfBudget(noConflicts);
-        lbool ret = solveLimited(currentCube);
-        if(ret == l_True){
-            printf("c got SAT answer??? \n");
-        }
-        else if(ret == l_Undef){
+        if(value(ps[index]) == l_Undef){
             vector<int> newCube;
             for(int i = 0 ; i < currentCube.size();i++)
                 newCube.push_back(toInt(currentCube[i]));
             cubes_out.push_back(newCube);
-            if(cubes_out.size() % 1000 == 0){
-                printf("c generated %d cubes so far! \n", cubes_out.size());
+//            if(cubes_out.size() % 1000 == 0){
+//                printf("c generated %d cubes so far! \n", cubes_out.size());
+//            }
+            int dlBefore = decisionLevel();
+            newDecisionLevel();
+            uncheckedEnqueue(ps[index]);
+            CRef confl = propagate();
+            if(confl == CRef_Undef){
+                currentCube.push(ps[index]);
+                genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking + 1);
+                currentCube.pop();
             }
-            currentCube.push(ps[index]);
-            genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking+1);
-            currentCube.pop();
-            currentCube.push(~ps[index]);
-            genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking+0.7);
-            currentCube.pop();
+            cancelUntil(dlBefore);
+
+            newDecisionLevel();
+            uncheckedEnqueue(~ps[index]);
+            confl = propagate();
+            if(confl == CRef_Undef){
+                currentCube.push(~ps[index]);
+                genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking + 0.7);
+                currentCube.pop();
+            }
+            cancelUntil(dlBefore);
+
         }
+        else{
+            int dlBefore = decisionLevel();
+            genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking);
+            assert(decisionLevel() == dlBefore);
+        }
+        /*if(restoreTrail(currentCube)){
+            if(value(ps[index]) == l_Undef){
+
+
+                vector<int> newCube;
+                for(int i = 0 ; i < currentCube.size();i++)
+                    newCube.push_back(toInt(currentCube[i]));
+                cubes_out.push_back(newCube);
+                if(cubes_out.size() % 1000 == 0){
+                    printf("c generated %d cubes so far! \n", cubes_out.size());
+                }
+                currentCube.push(ps[index]);
+                genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking+1);
+                currentCube.pop();
+                currentCube.push(~ps[index]);
+                genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking+0.7);
+                currentCube.pop();
+
+            }
+            else{
+                genCubes(ps, index+1, currentCube, cubes_out, noConflicts, ranking);
+            }
+        }
+        else{
+            // Okay this yields a conflict directly, backtrack...
+        }*/
+
     }
 }
 void Solver::genAllCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_out){
@@ -3144,6 +3186,22 @@ void Solver::genAllCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_o
 void Solver::genTestCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_out){
     vector<vector<int> > allCubes;
     genAllCubes(ps, allCubes);
+    assert(0 == decisionLevel());
+    printf("c genAllCubes returned %d cubes! \n", allCubes.size());
+    // Test: Check these cubes:
+    bool testCubes = true;
+    if(testCubes){
+        for(int i = 0 ; i < allCubes.size();i++){
+            vector<int> & v = allCubes[i];
+            vec<Lit> ps;
+            for(int j = 0 ; j < v.size();j++)
+                ps.push(toLit(v[j]));
+            if(!restoreTrail(ps)){
+                printf("c could not restore this cube! \n");
+            }
+            cancelUntil(0);
+        }
+    }
     // Take the first one of size 12
     for(int i = 0 ; i < allCubes.size();i++){
         if(allCubes[i].size() == 12){

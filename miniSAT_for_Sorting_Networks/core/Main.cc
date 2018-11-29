@@ -1438,8 +1438,8 @@ void addInputImprovedEncoding(Solver &s, vector<bool> &newInput, int n, int d, t
                         break;
                 }
                 if(lead_here != leadingZeros || tail_here != tailingOnes){
-                    if(myMPI_rank <= 0)
-                        printf("c after layer %d: all fixed! %d lead, %d tail (before: %d, %d) \n", i, lead_here, tail_here, leadingZeros, tailingOnes);
+                    //if(myMPI_rank <= 0)
+                    //    printf("c after layer %d: all fixed! %d lead, %d tail (before: %d, %d) \n", i, lead_here, tail_here, leadingZeros, tailingOnes);
                     assert(lead_here >= leadingZeros);
                     leadingZeros = lead_here;
                     assert(tail_here >= tailingOnes);
