@@ -2052,7 +2052,7 @@ void addTestLiterals_oneIn(int layer, int n, int minFrom, int maxTo, triVarMap &
 
 void addTestLiterals(int layer, int minFrom, int maxTo, int maxLength, triVarMap &compVarsInCreatedNW){
     for(int i = minFrom ; i < maxTo ; i++){
-        for(int j = maxLength ; j >= 1  ; j--){
+        for(int j = i ; j <= maxLength  ; j++){
             int from = i;
             int to = i+j;
             if(to <= maxTo && compVarsInCreatedNW.count(comparator(layer, from, to))){

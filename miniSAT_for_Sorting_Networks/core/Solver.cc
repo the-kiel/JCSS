@@ -70,6 +70,7 @@ static IntOption     opt_shortCube     (_cat, "shortCube",      "Cubes with this
 
 static BoolOption    opt_testConfigurations       (_cat, "testConfigs",        "Test possible configurations", false);
 static IntOption     opt_testConfigIndex     (_cat, "config2Test",      "Cubes with this size will be considered small", 6, IntRange(0, INT32_MAX));
+static BoolOption    opt_binwatchers      (_cat, "binwatchers",    "Use binary watchers", false);
 //=================================================================================================
 // Constructor/Destructor:
 
@@ -93,7 +94,7 @@ Solver::Solver() :
   , garbage_frac     (opt_garbage_frac)
   , restart_first    (opt_restart_first)
   , restart_inc      (opt_restart_inc)
-
+  , nbReducedClauses(0)
     // Parameters (the rest):
     //
   , learntsize_factor((double)1/(double)3), learntsize_inc(1.1)
@@ -117,6 +118,7 @@ Solver::Solver() :
   , cla_inc            (1)
   , var_inc            (1)
   , watches            (WatcherDeleted(ca))
+  , watchesBin            (WatcherDeleted(ca))
   , qhead              (0)
   , simpDB_assigns     (-1)
   , simpDB_props       (0)
@@ -151,6 +153,8 @@ Var Solver::newVar(bool sign, bool dvar)
     int v = nVars();
     watches  .init(mkLit(v, false));
     watches  .init(mkLit(v, true ));
+    watchesBin  .init(mkLit(v, false));
+    watchesBin  .init(mkLit(v, true ));
     assigns  .push(l_Undef);
     vardata  .push(mkVarData(CRef_Undef, 0));
     activity .push(rnd_init_act ? drand(random_seed) * 0.00001 : 0);
@@ -200,8 +204,16 @@ bool Solver::addClause_(vec<Lit>& ps)
 void Solver::attachClause(CRef cr) {
     const Clause& c = ca[cr];
     assert(c.size() > 1);
+    if(c.size()==2 && opt_binwatchers) {
+      watchesBin[~c[0]].push(Watcher(cr, c[1]));
+      watchesBin[~c[1]].push(Watcher(cr, c[0]));
+    } else {
+      watches[~c[0]].push(Watcher(cr, c[1]));
+      watches[~c[1]].push(Watcher(cr, c[0]));
+    }
+    /*
     watches[~c[0]].push(Watcher(cr, c[1]));
-    watches[~c[1]].push(Watcher(cr, c[0]));
+    watches[~c[1]].push(Watcher(cr, c[0]));*/
     if (c.learnt()) learnts_literals += c.size();
     else            clauses_literals += c.size(); }
 
@@ -209,15 +221,34 @@ void Solver::attachClause(CRef cr) {
 void Solver::detachClause(CRef cr, bool strict) {
     const Clause& c = ca[cr];
     assert(c.size() > 1);
-    
-    if (strict){
+    if(c.size()==2 && opt_binwatchers) {
+      if (strict){
+        remove(watchesBin[~c[0]], Watcher(cr, c[1]));
+        remove(watchesBin[~c[1]], Watcher(cr, c[0]));
+      }else{
+        // Lazy detaching: (NOTE! Must clean all watcher lists before garbage collecting this clause)
+        watchesBin.smudge(~c[0]);
+        watchesBin.smudge(~c[1]);
+      }
+    } else {
+      if (strict){
+        remove(watches[~c[0]], Watcher(cr, c[1]));
+        remove(watches[~c[1]], Watcher(cr, c[0]));
+      }else{
+        // Lazy detaching: (NOTE! Must clean all watcher lists before garbage collecting this clause)
+        watches.smudge(~c[0]);
+        watches.smudge(~c[1]);
+      }
+    }
+
+    /*if (strict){
         remove(watches[~c[0]], Watcher(cr, c[1]));
         remove(watches[~c[1]], Watcher(cr, c[0]));
     }else{
         // Lazy detaching: (NOTE! Must clean all watcher lists before garbage collecting this clause)
         watches.smudge(~c[0]);
         watches.smudge(~c[1]);
-    }
+    }*/
 
     if (c.learnt()) learnts_literals -= c.size();
     else            clauses_literals -= c.size(); }
@@ -304,6 +335,11 @@ void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
     int pathC = 0;
     Lit p     = lit_Undef;
 
+    bool testStuff = false;
+    if(testStuff){
+        for(int i = 0 ; i < seen.size();i++)
+            assert(!seen[i]);
+    }
     // Generate conflict clause:
     //
     out_learnt.push();      // (leave room for the asserting literal)
@@ -312,6 +348,15 @@ void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
     do{
         assert(confl != CRef_Undef); // (otherwise should be UIP)
         Clause& c = ca[confl];
+
+        // Special case for binary clauses
+        // The first one has to be SAT
+        if( p != lit_Undef && c.size()==2 && value(c[0])==l_False) {
+         // printf("c okay here the binary clause trick kicks in! \n");
+          assert(value(c[1])==l_True);
+          Lit tmp = c[0];
+          c[0] =  c[1], c[1] = tmp;
+        }
 
         if (c.learnt()){
             claBumpActivity(c);
@@ -370,7 +415,8 @@ void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
                 out_learnt[j++] = out_learnt[i];
             else{
                 Clause& c = ca[reason(var(out_learnt[i]))];
-                for (int k = 1; k < c.size(); k++)
+                for (int k = ((c.size()==2) ? 0:1); k < c.size(); k++)
+                //for (int k = 1; k < c.size(); k++)
                     if (!seen[var(c[k])] && level(var(c[k])) > 0){
                         out_learnt[j++] = out_learnt[i];
                         break; }
@@ -382,6 +428,8 @@ void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
     max_literals += out_learnt.size();
     out_learnt.shrink(i - j);
     tot_literals += out_learnt.size();
+
+    minimisationWithBinaryResolution(out_learnt);
 
     // Find correct backtrack level:
     //
@@ -403,6 +451,46 @@ void Solver::analyze(CRef confl, vec<Lit>& out_learnt, int& out_btlevel)
     for (int j = 0; j < analyze_toclear.size(); j++) seen[var(analyze_toclear[j])] = 0;    // ('seen[]' is now cleared)
 }
 
+/******************************************************************
+ * Minimisation with binary reolution
+ ******************************************************************/
+void Solver::minimisationWithBinaryResolution(vec<Lit> &out_learnt) {
+
+  // Find the LBD measure
+
+  Lit p = ~out_learnt[0];
+
+  if(out_learnt.size() < 100){
+    MYFLAG++;
+
+    for(int i = 1;i<out_learnt.size();i++) {
+      permDiff[var(out_learnt[i])] = MYFLAG;
+    }
+
+    vec<Watcher>&  wbin  = watchesBin[p];
+    int nb = 0;
+    for(int k = 0;k<wbin.size();k++) {
+      Lit imp = wbin[k].blocker;
+      if(permDiff[var(imp)]==MYFLAG && value(imp)==l_True) {
+        nb++;
+        permDiff[var(imp)]= MYFLAG-1;
+      }
+      }
+    int l = out_learnt.size()-1;
+    if(nb>0) {
+      nbReducedClauses++;
+      for(int i = 1;i<out_learnt.size()-nb;i++) {
+        if(permDiff[var(out_learnt[i])]!=MYFLAG) {
+          Lit p = out_learnt[l];
+          out_learnt[l] = out_learnt[i];
+          out_learnt[i] = p;
+          l--;i--;
+        }
+      }
+      out_learnt.shrink(nb);
+    }
+  }
+}
 
 // Check if 'p' can be removed. 'abstract_levels' is used to abort early if the algorithm is
 // visiting literals at levels that cannot be removed later.
@@ -413,6 +501,12 @@ bool Solver::litRedundant(Lit p, uint32_t abstract_levels)
     while (analyze_stack.size() > 0){
         assert(reason(var(analyze_stack.last())) != CRef_Undef);
         Clause& c = ca[reason(var(analyze_stack.last()))]; analyze_stack.pop();
+        if(c.size()==2 && value(c[0])==l_False) {
+            //printf("c okay here I have to re-order!\n");
+          assert(value(c[1])==l_True);
+          Lit tmp = c[0];
+          c[0] =  c[1], c[1] = tmp;
+        }
 
         for (int i = 1; i < c.size(); i++){
             Lit p  = c[i];
@@ -499,12 +593,33 @@ CRef Solver::propagate()
     CRef    confl     = CRef_Undef;
     int     num_props = 0;
     watches.cleanAll();
-
+    watchesBin.cleanAll();
     while (qhead < trail.size()){
         Lit            p   = trail[qhead++];     // 'p' is enqueued fact to propagate.
         vec<Watcher>&  ws  = watches[p];
         Watcher        *i, *j, *end;
         num_props++;
+
+        // First, Propagate binary clauses
+        vec<Watcher>&  wbin  = watchesBin[p];
+
+        for(int k = 0;k<wbin.size();k++) {
+
+          Lit imp = wbin[k].blocker;
+
+          if(value(imp) == l_False) {
+              Clause & c = ca[wbin[k].cref];
+              assert(value(c[0]) == l_False && value(c[1]) == l_False);
+            return wbin[k].cref;
+          }
+
+          if(value(imp) == l_Undef) {
+              Clause & c = ca[wbin[k].cref];
+              assert(value(c[0]) == l_False ||  value(c[1]) == l_False);
+              assert(value(c[0]) == l_Undef ||  value(c[1]) == l_Undef);
+              uncheckedEnqueue(imp,wbin[k].cref);
+          }
+        }
 
         for (i = j = (Watcher*)ws, end = i + ws.size();  i != end;){
             // Try to avoid inspecting the clause:
@@ -601,7 +716,7 @@ void Solver::reduceDB()
 {
     int     i, j;
     double  extra_lim = cla_inc / learnts.size();    // Remove any clause below this activity
-    
+    printf("c reducedDB called! \n");
     sort(learnts, reduceDB_lt(ca));
     int middle = learnts.size()/2;
     // Don't delete binary or locked clauses. From the rest, delete clauses from the first half
@@ -623,6 +738,7 @@ void Solver::reduceDB()
     learnts.shrink(i - j);
     if(mpi_rank <= 0)
         printf("c reduce DB: %d -> %d clauses\n", i, j);
+    printf("c reducedDB called! \n");
     checkGarbage();
 }
 
@@ -957,14 +1073,21 @@ lbool Solver::checkLearnts(bool fullCheck){
 
 void Solver::removeSatisfied(vec<CRef>& cs)
 {
+    printf("c removeSatisfied called! \n");
     int i, j;
     for (i = j = 0; i < cs.size(); i++){
         Clause& c = ca[cs[i]];
-        if (satisfied(c) || c.canBeDel())
+        if (satisfied(c) || c.canBeDel()){
+            if(locked(c)){
+                //printf("c removing locked clause! \n");
+                //printf("c value of first literal is %d at level %d, second %d, size %d\n", value(c[0]) == l_True, level(var(c[0])), value(c[1]) == l_True, c.size());
+            }
             removeClause(cs[i]);
+        }
         else
             cs[j++] = cs[i];
     }
+    printf("c removeSatisfied done! \n");
     cs.shrink(i - j);
 }
 
@@ -1054,15 +1177,33 @@ lbool Solver::search(int nof_conflicts)
                 }
             }
             if (learnt_clause.size() == 1){
+                assert(backtrack_level == 0);
+                printf("c learnt unit clause "); printLit(learnt_clause[0]);
+                printf("\n");
                 uncheckedEnqueue(learnt_clause[0]);
             }else{
                 CRef cr = ca.alloc(learnt_clause, true);
+                assert(backtrack_level > 0);
+                assert(decisionLevel() > 0);
                 learnts.push(cr);
                 attachClause(cr);
                 claBumpActivity(ca[cr]);
                 ca[cr].setGood(LBD <= dyn_threshold);
                 updateThreshold(ca[cr].isGoodClause());
                 uncheckedEnqueue(learnt_clause[0], cr);
+                bool testThis = false;
+                if(testThis){
+                    int falseFound = 0;
+                    int trueFound = 0;
+                    for(int j = 0 ; j < learnt_clause.size();j++){
+                        if(value(learnt_clause[j]) == l_False)
+                            falseFound++;
+                        if(value(learnt_clause[j]) == l_True)
+                            trueFound++;
+                    }
+                    assert(trueFound == 1);
+                    assert(trueFound + falseFound == learnt_clause.size());
+                }
             }
 
             varDecayActivity();
@@ -1933,7 +2074,7 @@ void Solver::initParameters(){
     int tmp = opt_testConfigurations ? opt_testConfigIndex :  mpi_rank;
     // Restart interval: 1024, 2048 or 4096
     restart_interval = 2048;
-    switch(tmp % 3){
+    /*switch(tmp % 3){
     case 0:
         restart_interval = 1024;
         break;
@@ -1943,14 +2084,14 @@ void Solver::initParameters(){
     default:
         restart_interval = 4096;
     }
-    tmp /= 3;
+    tmp /= 3;*/
     // conflicts per cube: 100000, 250000
-    switch(tmp % 3){
+    switch(tmp % 2){
     case 0:
-        conflsPerCube = 50 * 1000;
+        conflsPerCube = 100 * 1000;
         break;
     case 1:
-        conflsPerCube = 100 * 1000;
+        conflsPerCube = 200 * 1000;
         break;
     case 2:
         conflsPerCube = 250 * 1000;
@@ -1958,11 +2099,12 @@ void Solver::initParameters(){
     default:
         conflsPerCube = 250 * 1000;
     }
-    tmp /= 3;
+    tmp /= 2;
     // Max size of clause DB: 200000, 500000, 1000000
-    switch(tmp % 3){
+    maxDB_size = conflsPerCube * 8;
+    /*switch(tmp % 2){
     case 0:
-        maxDB_size = conflsPerCube * 2;
+        maxDB_size = conflsPerCube * 4;
         break;
     case 1:
         maxDB_size = conflsPerCube * 4;
@@ -1970,7 +2112,7 @@ void Solver::initParameters(){
     default:
         maxDB_size = conflsPerCube * 8;
     }
-    tmp /= 3;
+    tmp /= 3;*/
     use_vsids_branching = tmp % 2;
     printf("c configured: myRank %d, restart %d confls %d maxDB %d\n", mpi_rank, restart_interval, conflsPerCube, maxDB_size);
     //assert(false && "TODO");
@@ -2379,10 +2521,11 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 }*/
                 //printf("c slave %d calling solve\n",mpi_rank );
                 int conflsBefore = conflicts;
+                int minBefore = nbReducedClauses;
                 solveCalls++;
                 lbool ret ;
                 if(shortCube){
-                    setConfBudget(5000);
+                    setConfBudget(50);
                     ret  = solveLimited(ass);
                 }
                 else{
@@ -2392,8 +2535,8 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                         FL_Check_With_Assumptions(ass);
                         Lit testLit = getNextBranchLitFromList(ass, firstCubes);
                         int budgetHere = conflsPerCube;
-                        if(testLit == lit_Undef && numUNSATfound==0)
-                                budgetHere = 10 * 1000;
+                        //if(testLit == lit_Undef && numUNSATfound==0)
+                        //        budgetHere = 10 * 1000;
 
                         setConfBudget(budgetHere);
                         //setConfBudget(conflsPerCube);
@@ -2403,7 +2546,7 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
 
                 if(ret == l_False){
                     numUNSATfound++;
-                    printf("c solver %d cube failed after %d conflicts\n", mpi_rank, conflicts - conflsBefore);
+                    printf("c solver %d cube failed after %d conflicts (%d clauses reduced)\n", mpi_rank, conflicts - conflsBefore, nbReducedClauses -  minBefore);
                     /*if(conflict.size() > 1){
                         vec<Lit> confl1;
                         for(int i = 0 ; i < conflict.size();i++)
@@ -2873,11 +3016,12 @@ void Solver::toDimacs(FILE* f, const vec<Lit>& assumps)
 
 void Solver::relocAll(ClauseAllocator& to)
 {
-    //printf("c reloc called! \n");
+    printf("c reloc called! \n");
     // All watchers:
     //
     // for (int i = 0; i < watches.size(); i++)
     watches.cleanAll();
+    watchesBin.cleanAll();
     for (int v = 0; v < nVars(); v++)
         for (int s = 0; s < 2; s++){
             Lit p = mkLit(v, s);
@@ -2885,6 +3029,9 @@ void Solver::relocAll(ClauseAllocator& to)
             vec<Watcher>& ws = watches[p];
             for (int j = 0; j < ws.size(); j++)
                 ca.reloc(ws[j].cref, to);
+            vec<Watcher>& ws2 = watchesBin[p];
+            for (int j = 0; j < ws2.size(); j++)
+                ca.reloc(ws2[j].cref, to);
         }
 
     // All reasons:
@@ -3109,7 +3256,7 @@ void Solver::updateBranchOrders(){
 }
 
 void Solver::genCubes(vec<Lit> & ps, int index, vec<Lit> & currentCube, std::vector<std::vector<int> > & cubes_out, int noConflicts, double ranking){
-    if(index >= ps.size() || ranking >= 14){
+    if(index >= ps.size() || ranking >= 13){
         // Nothing to do, just backtrack
     }
     else{
@@ -3189,7 +3336,7 @@ void Solver::genTestCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_
     assert(0 == decisionLevel());
     printf("c genAllCubes returned %d cubes! \n", allCubes.size());
     // Test: Check these cubes:
-    bool testCubes = true;
+    bool testCubes = false;
     if(testCubes){
         for(int i = 0 ; i < allCubes.size();i++){
             vector<int> & v = allCubes[i];
