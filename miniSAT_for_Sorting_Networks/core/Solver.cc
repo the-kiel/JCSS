@@ -1267,6 +1267,7 @@ lbool Solver::search(int nof_conflicts)
                 if (next == lit_Undef){
                     // Model found:
                     lastTrail.clear();
+                    checkResult();
                     for(int i = 0 ; i < trail.size();i++)
                         if(level(var(trail[i])) > 0 && reason(var(trail[i])) == CRef_Undef)
                             lastTrail.push(trail[i]);
@@ -2451,8 +2452,10 @@ bool Solver::master_solve(vec<Lit> & firstCubes){
         printf("c master tying to restore solution conflicts here: %d\n \n", conflicts);
         usleep(300 * 1000);
         //guide_to_sat.clear();
+        setConfBudget(1<<24);
+        printf("c running on cube of size %d\n", guide_to_sat.size());
         lbool restore = solveLimited(guide_to_sat);
-        printf("c return was true: %d and conflicts %d\n", restore == l_True, conflicts);
+        printf("c return was true: %c and conflicts %d\n", restore == l_True ? '1' : (restore == l_False ? '0' : 'x'), conflicts);
         return true;
     }
     return false;
@@ -2525,7 +2528,12 @@ void Solver::slave_solve(vec<Lit> & firstCubes){
                 solveCalls++;
                 lbool ret ;
                 if(shortCube){
-                    setConfBudget(50);
+                    Lit next = getNextBranchLitFromList(ass, firstCubes);
+                    cancelUntil(0);
+                    if(next != lit_Undef)
+                        setConfBudget(50);
+                    else
+                        setConfBudget(5000);
                     ret  = solveLimited(ass);
                 }
                 else{
@@ -3371,4 +3379,21 @@ void Solver::genTestCubes(vec<Lit> & ps, std::vector<std::vector<int> > & cubes_
             break;
         }
     }
+}
+
+bool Solver::checkResult(){
+    // Make sure all clauses are satisfied:
+    for(int i = 0 ; i < clauses.size();i++){
+        if(!satisfied(ca[clauses[i]])){
+            printf("c clause of size %d is not satisfied! \n", ca[clauses[i]].size());
+            return false;
+        }
+    }
+    for(int i = 0 ; i < learnts.size();i++){
+        if(!satisfied(ca[learnts[i]])){
+            printf("c clause of size %d is not satisfied! \n", ca[learnts[i]].size());
+            return false;
+        }
+    }
+    return false;
 }
